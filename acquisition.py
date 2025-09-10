@@ -1,9 +1,9 @@
 # acquisition.py
 import os, math, time, uuid, queue, threading, tempfile, datetime
-from typing import List, Callable, Optional, Dict, Any
+from typing import List, Callable, Optional, Dict, Any, Tuple
 import numpy as np
 
-# --- NI-DAQmx ---
+# --- NI-DAQmx ---------------------------------------------------------------
 _nidaqmx_import_error = None
 try:
     import nidaqmx
@@ -15,7 +15,7 @@ except Exception as _e:
     AnalogMultiChannelReader = None
     _nidaqmx_import_error = _e
 
-# --- TDMS ---
+# --- TDMS -------------------------------------------------------------------
 from nptdms import TdmsWriter, ChannelObject, RootObject, GroupObject
 
 
@@ -27,11 +27,13 @@ def _align_up(value: int, base: int) -> int:
 
 class AcquisitionManager:
     """
-    Core di acquisizione NI-9201 con:
-      • avvio automatico quando ci sono canali abilitati
-      • stream continuo con callback EveryN campioni
-      • writer TDMS a rotazione (default 60 s) con canale Time
-      • salvataggio sicuro del segmento parziale allo STOP
+    Core NI-9201 con:
+      • stream continuo Every N Samples
+      • grafici decimati
+      • writer TDMS a rotazione (default 60 s) SENZA PERDITE (sample-accurate)
+      • scrittura streaming (mini-segmenti) a RAM costante
+      • Time continuo in ogni file e proprietà wf_* coerenti
+      • stop_graceful: svuota il buffer driver e salva il residuo
     """
 
     def __init__(self, sample_rate=10000.0, callback_chunk=1000, rotate_seconds=60):
@@ -48,15 +50,16 @@ class AcquisitionManager:
         self._reader: Optional[AnalogMultiChannelReader] = None
         self._running = False
 
-        self._queue: "queue.Queue[tuple[int,np.ndarray]]" = queue.Queue(maxsize=2000)
+        # Coda: (start_index_globale, buffer[chan x samples])
+        self._queue: "queue.Queue[Tuple[int, np.ndarray]]" = queue.Queue(maxsize=4000)
         self._writer_thread: Optional[threading.Thread] = None
         self._writer_stop = threading.Event()
 
-        # cartella di lavoro (sostituita dalla UI quando parte il salvataggio)
+        # Cartella writer (sostituita dalla UI quando parte il salvataggio)
         self.temp_dir = os.path.join(tempfile.gettempdir(), f"ni9201_acq_{uuid.uuid4().hex}")
         os.makedirs(self.temp_dir, exist_ok=True)
 
-        # zero / mappe
+        # Zero / mappe / canali
         self._zero: Dict[str, Optional[float]] = {}
         self._ai_channels: List[str] = []
         self._channel_names: List[str] = []
@@ -64,19 +67,23 @@ class AcquisitionManager:
         self._last_raw: Dict[str, Optional[float]] = {f"ai{i}": None for i in range(8)}
         self._sensor_map_by_phys: Dict[str, Dict[str, Any]] = {}
 
-        # registrazione TDMS
+        # Registrazione TDMS
         self._recording_enabled = False
         self._recording_toggle = threading.Event()
 
-        # callback UI
+        # Callback UI
         self.on_channel_value: Optional[Callable[[str, float], None]] = None
         self.on_new_instant_block: Optional[Callable[[np.ndarray, List[np.ndarray], List[str]], None]] = None
         self.on_new_chart_points: Optional[Callable[[np.ndarray, List[np.ndarray], List[str]], None]] = None
 
-        # decimazione grafico concatenato
+        # Decimazione grafico concatenato
         self._chart_decim = 10
 
-    # -------------------- API esposte alla UI --------------------
+        # Temporalizzazione sample-accurate
+        self._t0_epoch_s: Optional[float] = None  # tempo assoluto del campione #0
+        self._global_samples: int = 0             # contatore globale campioni per canale
+
+    # -------------------- API verso la UI --------------------
     def set_output_directory(self, path: str):
         if not path:
             return
@@ -97,7 +104,7 @@ class AcquisitionManager:
             self._recording_toggle.set()
 
     def zero_channel(self, chan_name: str):
-        self._zero[chan_name] = None  # al prossimo valore memorizza zero
+        self._zero[chan_name] = None  # al prossimo giro memorizza come zero
 
     def get_last_value(self, chan_name: str, apply_zero: bool = False) -> Optional[float]:
         val = self._last_raw.get(chan_name)
@@ -107,7 +114,7 @@ class AcquisitionManager:
             return abs(val - self._zero[chan_name])
         return val
 
-    # -------------------- Scoperta e limiti modulo --------------------
+    # -------------------- Scoperta / limiti modulo --------------------
     def list_ni9201_devices(self) -> List[str]:
         if System is None:
             return []
@@ -134,7 +141,6 @@ class AcquisitionManager:
         self.max_multi_rate_hz = None
         dev = self._get_device_by_name(device_name)
         if dev is None:
-            # fallback conservativo
             self.max_multi_rate_hz = 500_000.0
             self.max_single_rate_hz = 500_000.0
             return
@@ -171,20 +177,35 @@ class AcquisitionManager:
         self._channel_names = channel_names[:]
 
         try:
+            # --- rate per-canale (rispetta i limiti del 9201) ---
             per_chan = self._compute_per_channel_rate(device_name, len(self._ai_channels))
             self.current_rate_hz = per_chan
             self.current_agg_rate_hz = per_chan * max(1, len(self._ai_channels))
 
-            # callback ogni ~10 ms (allineato a multipli di 16)
+            # --- callback ogni ~10 ms, multipli di 16 ---
             target_cb_ms = 10.0
             raw_chunk = max(200, int(per_chan * target_cb_ms / 1000.0))
             self.callback_chunk = _align_up(raw_chunk, 16)
 
-            # buffer driver capiente (evita -200279)
+            # --- buffer driver capiente (evita -200279) ---
             daq_buf_seconds = 15.0
             desired = int(per_chan * daq_buf_seconds)
             daq_buf_samps = _align_up(max(desired, self.callback_chunk * 100), self.callback_chunk)
 
+            # --- QUEUE dimensionata (max 10 s o 256 MB) ---
+            nch = max(1, len(self._ai_channels))
+            bytes_per_block = nch * self.callback_chunk * 8  # float64
+            blocks_10s = max(50, int(per_chan * 10 / self.callback_chunk))
+            MEMORY_BUDGET_MB = 256
+            blocks_mem = max(50, int((MEMORY_BUDGET_MB * 1024 * 1024) / max(1, bytes_per_block)))
+            queue_capacity = min(blocks_10s, blocks_mem)
+            self._queue = queue.Queue(maxsize=queue_capacity)
+
+            # --- reset timing globale ---
+            self._t0_epoch_s = None
+            self._global_samples = 0
+
+            # --- config NI-DAQmx ---
             self._task = nidaqmx.Task()
             for ch in self._ai_channels:
                 self._task.ai_channels.add_ai_voltage_chan(
@@ -204,15 +225,16 @@ class AcquisitionManager:
                 self.callback_chunk, self._on_every_n_samples
             )
 
-            # writer
+            # --- writer thread ---
             self._writer_stop.clear()
             self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
             self._writer_thread.start()
 
+            # --- start acquisizione ---
             self._running = True
             self._task.start()
 
-            # decimazione per chart
+            # --- decimazione per grafico ---
             self._chart_decim = max(1, int(self.current_rate_hz // 50))
             return True
 
@@ -222,6 +244,7 @@ class AcquisitionManager:
             return False
 
     def stop(self):
+        """Stop immediato (può perdere gli ultimissimi ms nel buffer driver)."""
         self._running = False
         self.set_recording(False)
         try:
@@ -241,6 +264,74 @@ class AcquisitionManager:
             self._writer_thread.join(timeout=10)
         self._writer_thread = None
 
+    def stop_graceful(self, wait_ms: int = 150):
+        """
+        Stop con garanzia di salvataggio fino all'istante di chiamata:
+          1) breve attesa per scaricare i callback in volo
+          2) lettura sincrona di TUTTI i campioni residui nel buffer driver
+          3) accodo con indice globale corretto
+          4) flush finale del writer
+        """
+        if self._task is None:
+            # chiusura solo writer
+            self._running = False
+            self.set_recording(False)
+            self._writer_stop.set()
+            self._recording_toggle.set()
+            if self._writer_thread and self._writer_thread.is_alive():
+                self._writer_thread.join(timeout=10)
+            self._writer_thread = None
+            return
+
+        try:
+            self.set_recording(True)  # assicura che il writer salvi il residuo
+
+            t0 = time.time()
+            while (time.time() - t0) * 1000.0 < wait_ms:
+                time.sleep(0.005)
+
+            # drena buffer hardware
+            try:
+                avail = int(self._task.in_stream.avail_samp_per_chan)
+            except Exception:
+                avail = 0
+            while avail and avail > 0:
+                nch = len(self._ai_channels)
+                buf = np.empty((nch, avail), dtype=np.float64)
+                self._reader.read_many_sample(buf, avail, timeout=1.0)
+                start_idx = self._global_samples
+                self._global_samples += avail
+                try:
+                    self._queue.put_nowait((start_idx, buf))
+                except queue.Full:
+                    self._queue.put((start_idx, buf), timeout=0.5)
+                try:
+                    avail = int(self._task.in_stream.avail_samp_per_chan)
+                except Exception:
+                    break
+
+            # chiudi segmento parziale
+            self.set_recording(False)
+            self._recording_toggle.set()
+
+        finally:
+            try:
+                self._running = False
+                self._task.stop()
+            except Exception:
+                pass
+            try:
+                self._task.close()
+            except Exception:
+                pass
+            self._task = None
+
+            self._writer_stop.set()
+            self._recording_toggle.set()
+            if self._writer_thread and self._writer_thread.is_alive():
+                self._writer_thread.join(timeout=10)
+            self._writer_thread = None
+
     # -------------------- Callback DAQ --------------------
     def _on_every_n_samples(self, task_handle, every_n_samples_event_type, number_of_samples, callback_data):
         if not self._running:
@@ -249,32 +340,40 @@ class AcquisitionManager:
             nch = len(self._ai_channels)
             buf = np.empty((nch, number_of_samples), dtype=np.float64)
             self._reader.read_many_sample(buf, number_of_samples, timeout=0.0)
+
             ts_ns = time.time_ns()
 
-            # cache ultimo valore per canale + callback istantaneo
+            # inizializza t0 con l'epoch del PRIMO campione del PRIMO blocco
+            if self._t0_epoch_s is None:
+                fs = float(self.current_rate_hz or 1.0)
+                self._t0_epoch_s = (ts_ns / 1e9) - (number_of_samples / fs)
+
+            # ultimo valore + zero
             for i, ch in enumerate(self._ai_channels):
                 raw_val = float(buf[i, -1])
                 self._last_raw[ch] = raw_val
                 val = raw_val
                 if ch in self._zero and self._zero[ch] is None:
-                    self._zero[ch] = val  # memorizzo lo zero al primo passaggio
+                    self._zero[ch] = val
                 if ch in self._zero and self._zero[ch] is not None:
                     val = abs(val - self._zero[ch])
                 name = self._channel_names[i] if i < len(self._channel_names) else ch
                 if self.on_channel_value:
                     self.on_channel_value(name, val)
 
-            # writer queue
+            # metti in coda con indice globale
+            start_idx = self._global_samples
+            self._global_samples += number_of_samples
             try:
-                self._queue.put_nowait((ts_ns, buf))
+                self._queue.put_nowait((start_idx, buf))
             except queue.Full:
-                self._queue.put((ts_ns, buf), timeout=0.2)
+                self._queue.put((start_idx, buf), timeout=0.2)
 
             # feed grafici
             if self.on_new_instant_block or self.on_new_chart_points:
-                n = buf.shape[1]
-                t0 = ts_ns / 1e9 - n / self.current_rate_hz
-                t = np.linspace(t0, t0 + (n - 1) / self.current_rate_hz, n)
+                fs = float(self.current_rate_hz or 1.0)
+                t0 = (self._t0_epoch_s or 0.0) + (start_idx / fs)
+                t = t0 + np.arange(number_of_samples, dtype=np.float64) / fs
                 names = self._channel_names or self._ai_channels
                 ys = [buf[i, :] for i in range(nch)]
                 if self.on_new_instant_block:
@@ -287,148 +386,222 @@ class AcquisitionManager:
             print("Callback error:", e)
             return 0
 
-    # -------------------- Writer TDMS (rotazione + flush parziale) --------------------
+    # -------------------- Writer TDMS (streaming, no buchi) --------------------
     def _writer_loop(self):
-        current_file: Optional[TdmsWriter] = None
-        current_start_ns: Optional[int] = None
-        last_rotate_ns: Optional[int] = None
-        acc: Dict[int, list] = {}
+        fs = float(self.current_rate_hz or 1.0)
+        seg_target_samples = max(1, int(self.rotate_seconds * fs))
 
-        def open_new_file():
-            nonlocal current_file, current_start_ns, last_rotate_ns, acc
-            if current_file:
-                current_file.close()
-            current_start_ns = time.time_ns()
-            last_rotate_ns = current_start_ns
-            fname = f"segment_{current_start_ns}.tdms"
-            path = os.path.join(self.temp_dir, fname)
-            acc = {i: [] for i in range(len(self._ai_channels))}
-            current_file = TdmsWriter(open(path, "wb"))
+        # mini-scrittura (streaming) per RAM costante
+        MIN_WRITE_SEC = 0.2
+        mini_target_samples = max(1, int(MIN_WRITE_SEC * fs))
 
-        def close_and_flush():
-            nonlocal current_file, acc, current_start_ns
-            if not current_file:
+        writer: Optional[TdmsWriter] = None
+        seg_start_idx: Optional[int] = None        # indice globale del primo campione del file corrente
+        seg_written: int = 0                       # campioni già scritti nel file corrente
+        open_file_path: Optional[str] = None
+
+        def _seg_start_time_s(idx: int) -> float:
+            t0 = float(self._t0_epoch_s or time.time())
+            return t0 + (idx / fs)
+
+        def _open_segment(idx0: int):
+            nonlocal writer, seg_start_idx, seg_written, open_file_path
+            _close_segment()
+            seg_start_idx = int(idx0)
+            seg_written = 0
+            start_s = _seg_start_time_s(seg_start_idx)
+            fname = f"segment_{int(start_s*1e9)}.tdms"
+            open_file_path = os.path.join(self.temp_dir, fname)
+            writer = TdmsWriter(open(open_file_path, "wb"))
+
+        def _close_segment():
+            nonlocal writer, open_file_path
+            if writer:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+                writer = None
+                open_file_path = None
+
+        def _write_miniseg(start_idx_in_file: int, block: np.ndarray):
+            """
+            Scrive un mini-segmento nel file corrente.
+            Time è CONTINUO dentro il file: t = offset_in_file + arange(n)/fs
+            I dati salvati sono in unità ingegneristiche (come Valore istantaneo).
+            """
+            if writer is None or seg_start_idx is None:
+                return
+            n = int(block.shape[1])
+            if n <= 0:
                 return
 
-            # concatena dati
-            ch_data = [
-                (np.concatenate(acc[i], axis=0) if acc[i] else np.array([], dtype=np.float64))
-                for i in range(len(self._ai_channels))
-            ]
-            n = ch_data[0].size if ch_data and ch_data[0].size else 0
-
-            start_time_s = (current_start_ns or time.time_ns()) / 1e9
-            # time relativo al segmento (riparte da 0; nel merge useremo wf_start_time)
-            t = (np.arange(n, dtype=np.float64) / float(self.current_rate_hz or 1.0)) if n > 0 else np.array([], dtype=np.float64)
+            # tempo del mini-segmento
+            start_s = _seg_start_time_s(seg_start_idx + start_idx_in_file)
+            t_rel = (start_idx_in_file / fs) + (np.arange(n, dtype=np.float64) / fs)  # << CONTINUO NEL FILE
 
             root = RootObject(properties={
-                "sample_rate": float(self.current_rate_hz) if self.current_rate_hz else 0.0,
+                "sample_rate": fs,
                 "channels": ",".join(self._channel_names or self._ai_channels),
-                "start_time_ns": int(current_start_ns or 0)
+                "start_index": int(seg_start_idx),
+                "chunk_offset": int(start_idx_in_file),
+                "start_time_epoch_s": float(start_s),
             })
             group = GroupObject("Acquisition")
 
-            channels = []
-            # Time
-            channels.append(
-                ChannelObject("Acquisition", "Time", t, properties={
+            chans = []
+            # Canale Time (secondi) — continuo nel file
+            chans.append(ChannelObject(
+                "Acquisition", "Time", t_rel, properties={
                     "unit_string": "s",
-                    "wf_start_time": datetime.datetime.fromtimestamp(start_time_s),
-                    "wf_increment": 1.0 / float(self.current_rate_hz or 1.0),
+                    "wf_start_time": datetime.datetime.fromtimestamp(_seg_start_time_s(seg_start_idx)),
+                    "wf_increment": 1.0 / fs,
                     "stored_domain": "time",
-                })
-            )
-            # Dati (Volt RAW) + meta
-            for i, name in enumerate(self._channel_names or self._ai_channels):
-                data = ch_data[i] if n > 0 else np.array([], dtype=np.float64)
+                }
+            ))
+
+            # Canali dati (INGEGNERIZZATI) — nome TDMS = "Nome canale" UI
+            for i, ui_name in enumerate(self._channel_names or self._ai_channels):
                 phys = self._ai_channels[i] if i < len(self._ai_channels) else f"ai{i}"
                 meta = self._sensor_map_by_phys.get(phys, {})
-                unit = meta.get("unit", "")
+                sensor_name = meta.get("sensor_name", "Voltage")
+                unit_eng = meta.get("unit", "") if sensor_name != "Voltage" else "V"
                 a = float(meta.get("a", 1.0))
                 b = float(meta.get("b", 0.0))
-                disp = meta.get("display_label", name)
+                baseline = self._zero.get(phys, None)
+
+                raw = np.ascontiguousarray(block[i])  # Volt
+                if baseline is not None:
+                    raw = np.abs(raw - float(baseline))
+                data_eng = a * raw + b
+
                 props = {
-                    "unit": "V",
-                    "engineer_unit": unit,
+                    # --- BASE richieste ---
+                    "Name": ui_name,                # stesso nome della UI
+                    "Description": sensor_name,     # tipo risorsa
+                    "Unit": unit_eng,               # unità fisica; "V" se Voltage
+
+                    # --- waveform (riferite all'inizio del FILE) ---
+                    "wf_start_time": datetime.datetime.fromtimestamp(_seg_start_time_s(seg_start_idx)),
+                    "wf_increment": 1.0 / fs,
+
+                    # --- meta utili ---
+                    "physical_channel": phys,
                     "scale_a": a,
                     "scale_b": b,
-                    "display_label": disp,
-                    "physical_channel": phys,
-                    "stored_domain": "Volt",
-                    "wf_start_time": datetime.datetime.fromtimestamp(start_time_s),
-                    "wf_increment": 1.0 / float(self.current_rate_hz or 1.0),
+                    "zero_applied": baseline is not None,
                 }
-                channels.append(ChannelObject("Acquisition", name, data, properties=props))
 
-            current_file.write_segment([root, group] + channels)
-            current_file.close()
-            current_file = None
-            acc = {}
+                chans.append(ChannelObject("Acquisition", ui_name, data_eng, properties=props))
+
+            writer.write_segment([root, group] + chans)
 
         try:
             while not self._writer_stop.is_set():
-                # Non in registrazione → dreno eventuali dati residui, salvo e chiudo
+                # Non in registrazione → drena eventuali dati e chiudi segmento
                 if not self._recording_enabled:
                     drained = False
                     while True:
                         try:
-                            _, buf = self._queue.get_nowait()
-                            if current_file is None:
-                                open_new_file()
-                            for i in range(buf.shape[0]):
-                                acc[i].append(np.ascontiguousarray(buf[i]))
+                            start_idx, buf = self._queue.get_nowait()
+                            if writer is None:
+                                _open_segment(start_idx)
+                            # split su confine file; scrivi subito i mini-segmenti
+                            block_idx = start_idx
+                            block = buf
+                            while block.shape[1] > 0:
+                                if seg_start_idx is None:
+                                    _open_segment(block_idx)
+                                expected = (seg_start_idx + seg_written) if seg_start_idx is not None else block_idx
+                                if block_idx != expected:
+                                    _close_segment()
+                                    _open_segment(block_idx)
+
+                                remaining_file = seg_target_samples - seg_written
+                                if remaining_file <= 0:
+                                    _close_segment()
+                                    _open_segment(block_idx)
+
+                                take = min(remaining_file, block.shape[1])
+                                part = block[:, :take]
+                                _write_miniseg(seg_written, part)
+                                seg_written += take
+
+                                if seg_written >= seg_target_samples:
+                                    _close_segment()
+                                    _open_segment(block_idx + take)
+
+                                block_idx += take
+                                block = block[:, take:]
                             drained = True
                         except queue.Empty:
                             break
-                    if current_file:
-                        # se ho raccolto qualcosa o anche nulla, chiudo il segmento parziale
-                        close_and_flush()
-                    # attendo finché non cambia stato
+                    _close_segment()
                     self._recording_toggle.wait(timeout=0.2)
                     self._recording_toggle.clear()
                     continue
 
                 # Registrazione attiva
-                if current_file is None:
-                    open_new_file()
-
                 try:
-                    _, buf = self._queue.get(timeout=0.2)
+                    start_idx, buf = self._queue.get(timeout=0.2)
                 except queue.Empty:
-                    # rotate time-based
-                    if last_rotate_ns is not None and (time.time_ns() - last_rotate_ns > self.rotate_seconds * 1e9):
-                        close_and_flush()
-                        open_new_file()
                     self._recording_toggle.wait(timeout=0.05)
                     self._recording_toggle.clear()
                     continue
 
-                # accodo blocco
-                for i in range(buf.shape[0]):
-                    acc[i].append(np.ascontiguousarray(buf[i]))
+                if writer is None:
+                    _open_segment(start_idx)
 
-                # rotazione a tempo
-                now_ns = time.time_ns()
-                if last_rotate_ns is not None and (now_ns - last_rotate_ns > self.rotate_seconds * 1e9):
-                    close_and_flush()
-                    open_new_file()
+                # riallinea se necessario
+                expected = (seg_start_idx + seg_written) if seg_start_idx is not None else start_idx
+                if start_idx != expected:
+                    _close_segment()
+                    _open_segment(start_idx)
 
-            # uscita thread: flush finale (anche se recording era off)
-            if current_file:
-                while True:
-                    try:
-                        _, buf = self._queue.get_nowait()
-                        for i in range(buf.shape[0]):
-                            acc[i].append(np.ascontiguousarray(buf[i]))
-                    except queue.Empty:
-                        break
-                close_and_flush()
+                # confine file + scrittura streaming
+                block_idx = start_idx
+                block = buf
+                while block.shape[1] > 0:
+                    remaining_file = seg_target_samples - seg_written
+                    if remaining_file <= 0:
+                        _close_segment()
+                        _open_segment(block_idx)
+                        remaining_file = seg_target_samples
+
+                    take = min(remaining_file, block.shape[1])
+                    part = block[:, :take]
+                    _write_miniseg(seg_written, part)
+                    seg_written += take
+
+                    if seg_written >= seg_target_samples:
+                        _close_segment()
+                        _open_segment(block_idx + take)
+
+                    block_idx += take
+                    block = block[:, take:]
+
+            # uscita: drena e chiudi
+            drained_any = False
+            while True:
+                try:
+                    start_idx, buf = self._queue.get_nowait()
+                    if writer is None:
+                        _open_segment(start_idx)
+                    expected = (seg_start_idx + seg_written) if seg_start_idx is not None else start_idx
+                    if start_idx != expected:
+                        _close_segment()
+                        _open_segment(start_idx)
+                    _write_miniseg(seg_written, buf)
+                    seg_written += buf.shape[1]
+                    drained_any = True
+                except queue.Empty:
+                    break
+            _close_segment()
 
         except Exception as e:
             print("Writer error:", e)
             try:
-                if current_file:
-                    current_file.close()
+                _close_segment()
             except Exception:
                 pass
 
@@ -441,75 +614,3 @@ class AcquisitionManager:
         except Exception:
             pass
         self._task = None
-    def stop_graceful(self, wait_ms: int = 150):
-        """
-        Ferma l'acquisizione garantendo il salvataggio fino all'istante di Stop:
-        - lascia arrivare gli ultimi callback
-        - legge sincronicamente TUTTI i campioni residui nel buffer NI-DAQmx
-        - mette in coda e forza il flush del writer
-        - poi chiude il task e il writer thread
-        """
-        if self._task is None:
-            # niente da fare: chiusura standard writer
-            self._running = False
-            self.set_recording(False)
-            self._writer_stop.set()
-            self._recording_toggle.set()
-            if self._writer_thread and self._writer_thread.is_alive():
-                self._writer_thread.join(timeout=10)
-            self._writer_thread = None
-            return
-
-        try:
-            # Assicurati che il writer stia registrando per catturare il residuo
-            self.set_recording(True)
-
-            # 1) piccolo wait per far arrivare eventuali callback in volo
-            t0 = time.time()
-            while (time.time() - t0) * 1000.0 < wait_ms:
-                time.sleep(0.005)
-
-            # 2) leggi tutto il residuo dal buffer hardware
-            try:
-                avail = int(self._task.in_stream.avail_samp_per_chan)
-            except Exception:
-                avail = 0
-            while avail and avail > 0:
-                nch = len(self._ai_channels)
-                buf = np.empty((nch, avail), dtype=np.float64)
-                # lettura bloccante con timeout breve
-                self._reader.read_many_sample(buf, avail, timeout=1.0)
-                ts_ns = time.time_ns()
-                try:
-                    self._queue.put_nowait((ts_ns, buf))
-                except queue.Full:
-                    self._queue.put((ts_ns, buf), timeout=0.5)
-                try:
-                    avail = int(self._task.in_stream.avail_samp_per_chan)
-                except Exception:
-                    break
-
-            # 3) disattiva registrazione → il writer drena e chiude il segmento parziale
-            self.set_recording(False)
-            self._recording_toggle.set()
-
-        finally:
-            # 4) ferma il task
-            try:
-                self._running = False
-                self._task.stop()
-            except Exception:
-                pass
-            try:
-                self._task.close()
-            except Exception:
-                pass
-            self._task = None
-
-            # 5) chiudi il writer thread (ha già flushato)
-            self._writer_stop.set()
-            self._recording_toggle.set()
-            if self._writer_thread and self._writer_thread.is_alive():
-                self._writer_thread.join(timeout=10)
-            self._writer_thread = None
-
