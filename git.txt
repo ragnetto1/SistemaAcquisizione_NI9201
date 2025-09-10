@@ -1,0 +1,16 @@
+git init
+git remote add origin https://github.com/ragnetto1/SistemaAcquisizione_NI9201.git
+git remote -v
+git clone https://github.com/ragnetto1/SistemaAcquisizione_NI9201.git
+
+#################
+
+git add .
+git commit -m "6 Push, 20062025 migliorare comportamento tasto Excel, è brutto che si nasconda"
+git branch -M main
+git remote add origin https://github.com/ragnetto1/SistemaAcquisizione_NI9201.git
+git push origin main
+
+##############
+git checkout main
+git pull origin main
