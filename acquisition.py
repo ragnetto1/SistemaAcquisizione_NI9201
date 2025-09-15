@@ -116,14 +116,72 @@ class AcquisitionManager:
 
     # -------------------- Scoperta / limiti modulo --------------------
     def list_ni9201_devices(self) -> List[str]:
+        """Versione tollerante: include moduli simulati anche quando product_type è vuoto."""
         if System is None:
             return []
-        out = []
+        found = []
         try:
             for dev in System.local().devices:
-                pt = (getattr(dev, "product_type", "") or "").upper()
-                if "9201" in pt:
-                    out.append(dev.name)
+                name = getattr(dev, "name", "")
+                pt = (getattr(dev, "product_type", "") or "")
+                pt_u = pt.upper()
+                is_9201 = "9201" in pt_u
+
+                # Heuristica di fallback: 9201 ha 8 analog input fisici
+                try:
+                    n_ai = len(getattr(dev, "ai_physical_chans", []))
+                except Exception:
+                    n_ai = 0
+                looks_like_9201 = (n_ai == 8)
+
+                if is_9201 or looks_like_9201:
+                    found.append(name)
+        except Exception:
+            pass
+        return found
+
+
+    def list_ni9201_devices_meta(self) -> List[Dict[str, Any]]:
+        """
+        Restituisce metadati robusti per i moduli NI-9201 (reali o simulati).
+        Ogni elemento: {"name","product_type","is_simulated","chassis"}
+        """
+        if System is None:
+            return []
+        out: List[Dict[str, Any]] = []
+        try:
+            for dev in System.local().devices:
+                name = getattr(dev, "name", "")
+                pt = (getattr(dev, "product_type", "") or "")
+                pt_u = pt.upper()
+
+                # match flessibile
+                try:
+                    n_ai = len(getattr(dev, "ai_physical_chans", []))
+                except Exception:
+                    n_ai = 0
+                if "9201" not in pt_u and n_ai != 8:
+                    continue
+
+                # simulato?
+                is_sim = bool(getattr(dev, "is_simulated", False))
+
+                # chassis: prima prova con property, poi fallback sul prefisso 'cDAQxMody' → 'cDAQx'
+                ch_name = ""
+                try:
+                    ch = getattr(dev, "chassis_device", None)
+                    ch_name = getattr(ch, "name", "") if ch is not None else ""
+                except Exception:
+                    ch_name = ""
+                if not ch_name:
+                    ch_name = name.split("Mod")[0] if "Mod" in name else ""
+
+                out.append({
+                    "name": name,
+                    "product_type": pt if pt else "NI 9201",
+                    "is_simulated": is_sim,
+                    "chassis": ch_name,
+                })
         except Exception:
             pass
         return out

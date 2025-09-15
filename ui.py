@@ -204,18 +204,75 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     # ----------------------------- Devices -----------------------------
     def refresh_devices(self):
-        devices = self.acq.list_ni9201_devices()
+        """
+        Popola la combo dispositivi includendo anche i moduli simulati.
+        Se sono presenti più NI-9201, apre un dialog per scegliere:
+        mostra 'nome modulo', 'chassis' e tag '[SIMULATED]'.
+        """
+        # usa i metadati completi dal core
+        try:
+            metas = self.acq.list_ni9201_devices_meta()
+        except AttributeError:
+            # retrocompat: se la versione del core non ha il metodo, fallback
+            names = self.acq.list_ni9201_devices()
+            metas = [{"name": n, "product_type": "NI 9201", "is_simulated": False,
+                      "chassis": n.split("Mod")[0] if "Mod" in n else ""} for n in names]
+        except Exception:
+            metas = []
+
+        # Aggiorna combo: testo "cDAQ1Mod1 — NI 9201 — (cDAQ1) [SIMULATED]" ma userData=nome pulito
         self.cmbDevice.blockSignals(True)
         self.cmbDevice.clear()
-        for d in devices:
-            self.cmbDevice.addItem(d)
+        for m in metas:
+            name = m.get("name", "?")
+            pt = m.get("product_type", "")
+            ch = m.get("chassis", "")
+            sim = " [SIMULATED]" if m.get("is_simulated") else ""
+            label = f"{name} — {pt} — ({ch}){sim}" if ch else f"{name} — {pt}{sim}"
+            self.cmbDevice.addItem(label, userData=name)
         self.cmbDevice.blockSignals(False)
-        self._device_ready = bool(devices)
 
+        self._device_ready = bool(metas)
+
+        # scelta automatica / dialog se più device
+        if not metas:
+            QtWidgets.QMessageBox.information(self, "Nessun dispositivo",
+                                              "Nessun NI-9201 trovato. Verifica in NI-MAX (anche simulati).")
+        elif len(metas) == 1:
+            self.cmbDevice.setCurrentIndex(0)
+        else:
+            chosen = self._prompt_device_choice(metas)
+            if chosen:
+                # seleziona item con quel name in userData
+                for i in range(self.cmbDevice.count()):
+                    if self.cmbDevice.itemData(i) == chosen:
+                        self.cmbDevice.setCurrentIndex(i)
+                        break
+
+        # come prima: ricostruzione tabella/definizioni/scale
         self._populate_table()
         self._populate_type_column()
         self._recompute_all_calibrations()
         self.lblRateInfo.setText("—")
+
+    def _prompt_device_choice(self, metas):
+        items = []
+        for m in metas:
+            name = m.get("name", "?")
+            pt = m.get("product_type", "")
+            ch = m.get("chassis", "")
+            sim = " [SIMULATED]" if m.get("is_simulated") else ""
+            label = f"{name} — {pt} — ({ch}){sim}" if ch else f"{name} — {pt}{sim}"
+            items.append(label)
+        item, ok = QtWidgets.QInputDialog.getItem(
+            self, "Seleziona dispositivo",
+            "Sono presenti più moduli NI-9201.\nScegli quello da usare:",
+            items, 0, False
+        )
+        if not ok or not item:
+            return None
+        # estrai il name prima della prima " — "
+        return item.split(" — ", 1)[0]
 
     def _on_device_changed(self, _):
         self._stop_acquisition_ui_only()
@@ -437,7 +494,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self._auto_change = False
             return
 
-        device = self.cmbDevice.currentText().strip()
+        # PRENDE SEMPRE IL "NAME" PULITO dal userData della combo
+        device = (self.cmbDevice.currentData() or self.cmbDevice.currentText()).strip()
         phys, labels = self._enabled_phys_and_labels()
 
         if not phys:
