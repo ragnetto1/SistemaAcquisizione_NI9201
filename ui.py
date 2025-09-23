@@ -428,7 +428,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
             # Azzeramento
             btnZero = QtWidgets.QPushButton("Azzeramento")
-            btnZero.clicked.connect(lambda _, c=phys: self.acq.zero_channel(c))
+            btnZero.clicked.connect(lambda _, c=phys: self._on_zero_button_clicked(c))
             self.table.setCellWidget(i, COL_ZERO_BTN, btnZero)
 
             # Valore azzerato (display/placeholder)
@@ -591,6 +591,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._save_dir = base_dir
         self._base_filename = base_name
 
+        self._set_table_lock(True)
         # countdown
         self._countdown = 60
         self._update_start_button_text()
@@ -602,6 +603,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.btnBrowseDir.setEnabled(False)
         self.txtBaseName.setEnabled(False)
         self.btnStart.setEnabled(False)
+        
+        
 
     def _tick_countdown(self):
         if not self.acq.recording_enabled:
@@ -655,7 +658,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Errore ricomposizione", str(e))
         finally:
             self._active_subdir = None
-
+        self._set_table_lock(False)
+        self._uncheck_all_enabled()
     # ----------------------------- Grafici -----------------------------
     def _reset_plots(self):
         self._chart_x.clear()
@@ -839,3 +843,98 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
+    
+    def _on_zero_button_clicked(self, phys: str):
+        """
+        Azzeramento canale:
+        - Legge il valore istantaneo ATTUALE (in unità ingegneristiche)
+        - Lo mostra in colonna 'Valore azzerato'
+        - Fissa lo zero nel core come valore RAW (Volt) dell'istante
+        """
+        # riga del canale
+        r = self._find_row_by_phys(phys)
+        if r < 0:
+            return
+
+        # 1) valore istantaneo in unità ingegneristiche (quello che vedi in UI)
+        try:
+            val_eng = self.acq.get_last_engineered(phys)
+        except Exception:
+            val_eng = None
+
+        # unità per visualizzazione
+        unit = self._calib_by_phys.get(phys, {}).get("unit", "")
+        if val_eng is not None:
+            txt = f"{val_eng:.6g}" + (f" {unit}" if unit else "")
+            self._auto_change = True
+            self.table.item(r, COL_ZERO_VAL).setText(txt)
+            self._auto_change = False
+
+        # 2) imposta lo zero nel core come baseline RAW (Volt)
+        try:
+            last_raw = self.acq.get_last_raw(phys)
+            if last_raw is not None:
+                self.acq.set_zero_raw(phys, last_raw)
+        except Exception:
+            pass
+    def _set_row_bg(self, row: int, col: int, color: QtGui.QColor):
+        item = self.table.item(row, col)
+        if item is None:
+            item = QtWidgets.QTableWidgetItem("")
+            self.table.setItem(row, col, item)
+        item.setBackground(color)
+
+    def _set_table_lock(self, lock: bool):
+        """
+        Blocca/sblocca le 5 colonne: Abilita, Canale fisico, Tipo risorsa,
+        Nome canale, Valore istantaneo. Grigio chiaro quando lock=True.
+        """
+        gray = QtGui.QColor("#e9ecef")
+        white = QtGui.QColor("#ffffff")
+        nrows = self.table.rowCount()
+
+        for r in range(nrows):
+            # Abilita (checkbox)
+            w = self.table.cellWidget(r, self.COL_ENABLE)
+            if isinstance(w, QtWidgets.QCheckBox):
+                w.setEnabled(not lock)
+            self._set_row_bg(r, self.COL_ENABLE, gray if lock else white)
+
+            # Canale fisico (item non editabile)
+            it = self.table.item(r, self.COL_PHYS)
+            if it:
+                flags = QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled
+                it.setFlags(flags)  # resta non editabile in entrambi i casi
+            self._set_row_bg(r, self.COL_PHYS, gray if lock else white)
+
+            # Tipo risorsa (combo)
+            w = self.table.cellWidget(r, self.COL_TYPE)
+            if isinstance(w, QtWidgets.QComboBox):
+                w.setEnabled(not lock)
+            self._set_row_bg(r, self.COL_TYPE, gray if lock else white)
+
+            # Nome canale (item editabile quando unlock)
+            it = self.table.item(r, self.COL_LABEL)
+            if it:
+                if lock:
+                    it.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+                else:
+                    it.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsEditable)
+            self._set_row_bg(r, self.COL_LABEL, gray if lock else white)
+
+            # Valore istantaneo (sola lettura, solo colore)
+            self._set_row_bg(r, self.COL_VALUE, gray if lock else white)
+
+    def _uncheck_all_enabled(self):
+        """Rimuove tutte le spunte 'Abilita' (senza scatenare ri-configurazioni ripetute)."""
+        self._auto_change = True
+        try:
+            nrows = self.table.rowCount()
+            for r in range(nrows):
+                w = self.table.cellWidget(r, self.COL_ENABLE)
+                if isinstance(w, QtWidgets.QCheckBox):
+                    w.setChecked(False)
+        finally:
+            self._auto_change = False
+        # applica lo stato all’acquisizione
+        self._update_acquisition_from_table()

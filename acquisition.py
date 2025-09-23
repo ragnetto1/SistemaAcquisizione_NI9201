@@ -411,10 +411,14 @@ class AcquisitionManager:
                 raw_val = float(buf[i, -1])
                 self._last_raw[ch] = raw_val
                 val = raw_val
-                if ch in self._zero and self._zero[ch] is None:
-                    self._zero[ch] = val
-                if ch in self._zero and self._zero[ch] is not None:
-                    val = abs(val - self._zero[ch])
+                baseline = self._zero.get(ch, None)
+                if baseline is not None:
+                    val = val - float(baseline)   # << shift sottratto (niente abs)
+                # applica calibrazione per il valore mostrato in UI
+                meta = self._sensor_map_by_phys.get(ch, {})
+                a = float(meta.get("a", 1.0))
+                b = float(meta.get("b", 0.0))
+                val = a * val + b
                 name = self._channel_names[i] if i < len(self._channel_names) else ch
                 if self.on_channel_value:
                     self.on_channel_value(name, val)
@@ -518,7 +522,7 @@ class AcquisitionManager:
                 }
             ))
 
-            # Canali dati (INGEGNERIZZATI) — nome TDMS = "Nome canale" UI
+            # Canali dati (INGEGNERIZZATI) — nome TDMS = "Nome canale" UI (Base Name)
             for i, ui_name in enumerate(self._channel_names or self._ai_channels):
                 phys = self._ai_channels[i] if i < len(self._ai_channels) else f"ai{i}"
                 meta = self._sensor_map_by_phys.get(phys, {})
@@ -530,26 +534,29 @@ class AcquisitionManager:
 
                 raw = np.ascontiguousarray(block[i])  # Volt
                 if baseline is not None:
-                    raw = np.abs(raw - float(baseline))
+                    raw = raw - float(baseline)       # shift sottratto
                 data_eng = a * raw + b
 
-                props = {
-                    # --- BASE richieste ---
-                    "Name": ui_name,                # stesso nome della UI
-                    "Description": sensor_name,     # tipo risorsa
-                    "Unit": unit_eng,               # unità fisica; "V" se Voltage
+                # shift equivalente in unità ingegneristiche (solo meta-info)
+                zero_eng = (a * float(baseline)) if (baseline is not None) else 0.0
 
-                    # --- waveform (riferite all'inizio del FILE) ---
+                # >>> Base Properties <<<
+                # - channel name = ui_name
+                # - description = sensor_name
+                # - unit_string  = unit_eng
+                props = {
+                    "description": sensor_name,                           # Base Description
+                    "unit_string": unit_eng,                              # Base Unit
                     "wf_start_time": datetime.datetime.fromtimestamp(_seg_start_time_s(seg_start_idx)),
                     "wf_increment": 1.0 / fs,
-
-                    # --- meta utili ---
+                    # Meta aggiuntive (Extended)
                     "physical_channel": phys,
                     "scale_a": a,
                     "scale_b": b,
-                    "zero_applied": baseline is not None,
+                    "zero_applied": float(zero_eng),
                 }
 
+                # NB: il NOME del canale TDMS è 'ui_name' (=> Base Name = Nome canale in UI)
                 chans.append(ChannelObject("Acquisition", ui_name, data_eng, properties=props))
 
             writer.write_segment([root, group] + chans)
@@ -672,3 +679,33 @@ class AcquisitionManager:
         except Exception:
             pass
         self._task = None
+        # -------------------- Zeroing API --------------------
+    def set_zero_raw(self, phys_chan: str, raw_value: Optional[float]):
+        """Imposta lo zero per un canale come VALORE RAW in Volt (None per rimuoverlo)."""
+        if phys_chan not in self._last_raw:
+            self._last_raw[phys_chan] = None
+        self._zero[phys_chan] = float(raw_value) if raw_value is not None else None
+
+    def clear_zero(self, phys_chan: str):
+        """Rimuove lo zero dal canale."""
+        self.set_zero_raw(phys_chan, None)
+
+    def get_last_raw(self, phys_chan: str) -> Optional[float]:
+        """Ultimo valore RAW (Volt) letto su quel canale."""
+        return self._last_raw.get(phys_chan)
+
+    def get_last_engineered(self, phys_chan: str) -> Optional[float]:
+        """
+        Valore istantaneo in unità ingegneristiche, applicando zero (shift) e a*x+b.
+        """
+        raw = self._last_raw.get(phys_chan)
+        if raw is None:
+            return None
+        meta = self._sensor_map_by_phys.get(phys_chan, {})
+        a = float(meta.get("a", 1.0))
+        b = float(meta.get("b", 0.0))
+        baseline = self._zero.get(phys_chan, None)
+        if baseline is not None:
+            raw = raw - float(baseline)
+        return a * raw + b
+
