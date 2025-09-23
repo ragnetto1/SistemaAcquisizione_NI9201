@@ -894,46 +894,51 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         nrows = self.table.rowCount()
 
         for r in range(nrows):
-            # Abilita (checkbox)
-            w = self.table.cellWidget(r, self.COL_ENABLE)
-            if isinstance(w, QtWidgets.QCheckBox):
-                w.setEnabled(not lock)
-            self._set_row_bg(r, self.COL_ENABLE, gray if lock else white)
-
-            # Canale fisico (item non editabile)
-            it = self.table.item(r, self.COL_PHYS)
+            # --- Abilita (QTableWidgetItem con checkbox) ---
+            it = self.table.item(r, COL_ENABLE)
             if it:
-                flags = QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled
-                it.setFlags(flags)  # resta non editabile in entrambi i casi
-            self._set_row_bg(r, self.COL_PHYS, gray if lock else white)
+                if lock:
+                    # rimuovo la possibilità di spuntare
+                    it.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+                else:
+                    # riabilito la spunta
+                    it.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable)
+            self._set_row_bg(r, COL_ENABLE, gray if lock else white)
 
-            # Tipo risorsa (combo)
-            w = self.table.cellWidget(r, self.COL_TYPE)
+            # --- Canale fisico (sempre non editabile; solo colore) ---
+            it = self.table.item(r, COL_PHYS)
+            if it:
+                it.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+            self._set_row_bg(r, COL_PHYS, gray if lock else white)
+
+            # --- Tipo risorsa (QComboBox) ---
+            w = self.table.cellWidget(r, COL_TYPE)
             if isinstance(w, QtWidgets.QComboBox):
                 w.setEnabled(not lock)
-            self._set_row_bg(r, self.COL_TYPE, gray if lock else white)
+            self._set_row_bg(r, COL_TYPE, gray if lock else white)
 
-            # Nome canale (item editabile quando unlock)
-            it = self.table.item(r, self.COL_LABEL)
+            # --- Nome canale (item editabile quando unlock) ---
+            it = self.table.item(r, COL_LABEL)
             if it:
                 if lock:
                     it.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
                 else:
                     it.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsEditable)
-            self._set_row_bg(r, self.COL_LABEL, gray if lock else white)
+            self._set_row_bg(r, COL_LABEL, gray if lock else white)
 
-            # Valore istantaneo (sola lettura, solo colore)
-            self._set_row_bg(r, self.COL_VALUE, gray if lock else white)
+            # --- Valore istantaneo (display only; solo colore) ---
+            self._set_row_bg(r, COL_VALUE, gray if lock else white)
+
 
     def _uncheck_all_enabled(self):
-        """Rimuove tutte le spunte 'Abilita' (senza scatenare ri-configurazioni ripetute)."""
+        """Rimuove tutte le spunte 'Abilita' (senza scatenare ricalcoli ripetuti)."""
         self._auto_change = True
         try:
             nrows = self.table.rowCount()
             for r in range(nrows):
-                w = self.table.cellWidget(r, self.COL_ENABLE)
-                if isinstance(w, QtWidgets.QCheckBox):
-                    w.setChecked(False)
+                it = self.table.item(r, COL_ENABLE)
+                if it and it.flags() & QtCore.Qt.ItemIsUserCheckable:
+                    it.setCheckState(QtCore.Qt.Unchecked)
         finally:
             self._auto_change = False
         # applica lo stato all’acquisizione
