@@ -46,7 +46,7 @@ class AcquisitionManager:
         self.current_agg_rate_hz: Optional[float] = None
         self.max_single_rate_hz: Optional[float] = None
         self.max_multi_rate_hz: Optional[float] = None
-
+        self._start_channel_names: List[str] = []
         self._task = None
         self._reader: Optional[AnalogMultiChannelReader] = None
         self._running = False
@@ -234,6 +234,7 @@ class AcquisitionManager:
 
         self._ai_channels = ai_channels[:]
         self._channel_names = channel_names[:]
+        self._start_channel_names = channel_names[:]
 
         try:
             # --- rate per-canale (rispetta i limiti del 9201) ---
@@ -418,6 +419,9 @@ class AcquisitionManager:
             return 0
         try:
             nch = len(self._ai_channels)
+            if nch <= 0 or number_of_samples <= 0:
+                return 0
+
             buf = np.empty((nch, number_of_samples), dtype=np.float64)
             self._reader.read_many_sample(buf, number_of_samples, timeout=0.0)
 
@@ -428,24 +432,33 @@ class AcquisitionManager:
                 fs = float(self.current_rate_hz or 1.0)
                 self._t0_epoch_s = (ts_ns / 1e9) - (number_of_samples / fs)
 
-            # ultimo valore + zero
+            # nomi “freeze” (allinea lunghezza ai canali reali)
+            start_names = list(self._start_channel_names or self._ai_channels or [])
+            if len(start_names) < nch:
+                start_names += [self._ai_channels[i] for i in range(len(start_names), nch)]
+            elif len(start_names) > nch:
+                start_names = start_names[:nch]
+
+            # ultimo valore + zero + calibrazione → verso UI con nomi di start
             for i, ch in enumerate(self._ai_channels):
                 raw_val = float(buf[i, -1])
                 self._last_raw[ch] = raw_val
                 val = raw_val
                 baseline = self._zero.get(ch, None)
                 if baseline is not None:
-                    val = val - float(baseline)   # << shift sottratto (niente abs)
-                # applica calibrazione per il valore mostrato in UI
+                    val = val - float(baseline)
                 meta = self._sensor_map_by_phys.get(ch, {})
                 a = float(meta.get("a", 1.0))
                 b = float(meta.get("b", 0.0))
                 val = a * val + b
-                name = self._channel_names[i] if i < len(self._channel_names) else ch
-                if self.on_channel_value:
-                    self.on_channel_value(name, val)
 
-            # metti in coda con indice globale
+                if self.on_channel_value:
+                    try:
+                        self.on_channel_value(start_names[i], val)
+                    except Exception as e:
+                        print("Callback warning (channel_value):", e)
+
+            # enqueue blocco
             start_idx = self._global_samples
             self._global_samples += number_of_samples
             try:
@@ -453,22 +466,34 @@ class AcquisitionManager:
             except queue.Full:
                 self._queue.put((start_idx, buf), timeout=0.2)
 
-            # feed grafici
+            # feed grafico (nomi di start, tempo corretto)
             if self.on_new_instant_block or self.on_new_chart_points:
                 fs = float(self.current_rate_hz or 1.0)
                 t0 = (self._t0_epoch_s or 0.0) + (start_idx / fs)
                 t = t0 + np.arange(number_of_samples, dtype=np.float64) / fs
-                names = self._channel_names or self._ai_channels
+                names = start_names
                 ys = [buf[i, :] for i in range(nch)]
+
                 if self.on_new_instant_block:
-                    self.on_new_instant_block(t, ys, names)
+                    try:
+                        self.on_new_instant_block(t, ys, names)
+                    except Exception as e:
+                        print("Callback warning (instant_block):", e)
+
                 if self.on_new_chart_points:
-                    dec = slice(None, None, self._chart_decim)
-                    self.on_new_chart_points(t[dec], [y[dec] for y in ys], names)
+                    try:
+                        dec_step = int(self._chart_decim or 1)
+                        if dec_step <= 0: dec_step = 1
+                        dec = slice(None, None, dec_step)
+                        self.on_new_chart_points(t[dec], [y[dec] for y in ys], names)
+                    except Exception as e:
+                        print("Callback warning (chart_points):", e)
+
             return 0
         except Exception as e:
             print("Callback error:", e)
             return 0
+
 
     # -------------------- Writer TDMS (streaming, no buchi) --------------------
     def _writer_loop(self):
@@ -514,12 +539,13 @@ class AcquisitionManager:
             writer = None
             open_file_path = None
             seg_written = 0
-            
+        
+
         def _write_miniseg(start_idx_in_file: int, block: np.ndarray):
             """
             Scrive un mini-segmento nel file corrente.
             Time è CONTINUO dentro il file: t = offset_in_file + arange(n)/fs
-            I dati salvati sono in unità ingegneristiche (come Valore istantaneo).
+            I dati salvati sono in unità ingegneristiche (Valore istantaneo).
             """
             if writer is None or seg_start_idx is None:
                 return
@@ -527,13 +553,16 @@ class AcquisitionManager:
             if n <= 0:
                 return
 
+            # Nomi TDMS effettivi (sanificati + unici, 'Time' riservato)
+            tdms_names = self._current_tdms_names()
+
             # tempo del mini-segmento
             start_s = _seg_start_time_s(seg_start_idx + start_idx_in_file)
-            t_rel = (start_idx_in_file / fs) + (np.arange(n, dtype=np.float64) / fs)  # << CONTINUO NEL FILE
+            t_rel = (start_idx_in_file / fs) + (np.arange(n, dtype=np.float64) / fs)
 
             root = RootObject(properties={
                 "sample_rate": fs,
-                "channels": ",".join(self._channel_names or self._ai_channels),
+                "channels": ",".join(tdms_names),
                 "start_index": int(seg_start_idx),
                 "chunk_offset": int(start_idx_in_file),
                 "start_time_epoch_s": float(start_s),
@@ -541,136 +570,58 @@ class AcquisitionManager:
             group = GroupObject("Acquisition")
 
             chans = []
-            # Canale Time (secondi) — continuo nel file
-            chans.append(ChannelObject(
-                "Acquisition", "Time", t_rel, properties={
-                    "unit_string": "s",
-                    "wf_start_time": datetime.datetime.fromtimestamp(_seg_start_time_s(seg_start_idx)),
-                    "wf_increment": 1.0 / fs,
-                    "stored_domain": "time",
-                }
-            ))
-
-            # Canali dati (INGEGNERIZZATI) — nome TDMS = "Nome canale" UI (Base Name)
-            for i, ui_name in enumerate(self._channel_names or self._ai_channels):
-                phys = self._ai_channels[i] if i < len(self._ai_channels) else f"ai{i}"
-                meta = self._sensor_map_by_phys.get(phys, {})
-                sensor_name = meta.get("sensor_name", "Voltage")
-                unit_eng = meta.get("unit", "") if sensor_name != "Voltage" else "V"
-                a = float(meta.get("a", 1.0))
-                b = float(meta.get("b", 0.0))
-                baseline = self._zero.get(phys, None)
-
-                raw = np.ascontiguousarray(block[i])  # Volt
-                if baseline is not None:
-                    raw = raw - float(baseline)       # shift sottratto
-                data_eng = a * raw + b
-
-                # shift equivalente in unità ingegneristiche (solo meta-info)
-                zero_eng = (a * float(baseline)) if (baseline is not None) else 0.0
-
-                # >>> Base Properties <<<
-                # - channel name = ui_name
-                # - description = sensor_name
-                # - unit_string  = unit_eng
-                props = {
-                    "description": sensor_name,                           # Base Description
-                    "unit_string": unit_eng,                              # Base Unit
-                    "wf_start_time": datetime.datetime.fromtimestamp(_seg_start_time_s(seg_start_idx)),
-                    "wf_increment": 1.0 / fs,
-                    # Meta aggiuntive (Extended)
-                    "physical_channel": phys,
-                    "scale_a": a,
-                    "scale_b": b,
-                    "zero_applied": float(zero_eng),
-                }
-
-                # NB: il NOME del canale TDMS è 'ui_name' (=> Base Name = Nome canale in UI)
-                chans.append(ChannelObject("Acquisition", ui_name, data_eng, properties=props))
-
-            writer.write_segment([root, group] + chans)
-
-        try:
-            while not self._writer_stop.is_set():
-                # Non in registrazione → drena eventuali dati e chiudi segmento
-                if not self._recording_enabled:
-                    # Non in registrazione → NON scriviamo nulla.
-                # Dreniamo soltanto la coda per non accumulare RAM e chiudiamo eventuale file aperto.
-                    _close_segment()
-                    while True:
-                        try:
-                            _ = self._queue.get_nowait()
-                            # scarta il blocco
-                        except queue.Empty:
-                            break
-                    # attendi il toggle di registrazione o un breve timeout
-                    self._recording_toggle.wait(timeout=0.2)
-                    self._recording_toggle.clear()
-                    continue
-
-                # Registrazione attiva
-                try:
-                    start_idx, buf = self._queue.get(timeout=0.2)
-                except queue.Empty:
-                    self._recording_toggle.wait(timeout=0.05)
-                    self._recording_toggle.clear()
-                    continue
-
-                if writer is None:
-                    _open_segment(start_idx)
-
-                # riallinea se necessario
-                expected = (seg_start_idx + seg_written) if seg_start_idx is not None else start_idx
-                if start_idx != expected:
-                    _close_segment()
-                    _open_segment(start_idx)
-
-                # confine file + scrittura streaming
-                block_idx = start_idx
-                block = buf
-                while block.shape[1] > 0:
-                    remaining_file = seg_target_samples - seg_written
-                    if remaining_file <= 0:
-                        _close_segment()
-                        _open_segment(block_idx)
-                        remaining_file = seg_target_samples
-
-                    take = min(remaining_file, block.shape[1])
-                    part = block[:, :take]
-                    _write_miniseg(seg_written, part)
-                    seg_written += take
-
-                    if seg_written >= seg_target_samples:
-                        _close_segment()
-                        _open_segment(block_idx + take)
-
-                    block_idx += take
-                    block = block[:, take:]
-
-            # uscita: drena e chiudi
-            drained_any = False
-            while True:
-                try:
-                    start_idx, buf = self._queue.get_nowait()
-                    if writer is None:
-                        _open_segment(start_idx)
-                    expected = (seg_start_idx + seg_written) if seg_start_idx is not None else start_idx
-                    if start_idx != expected:
-                        _close_segment()
-                        _open_segment(start_idx)
-                    _write_miniseg(seg_written, buf)
-                    seg_written += buf.shape[1]
-                    drained_any = True
-                except queue.Empty:
-                    break
-            _close_segment()
-
-        except Exception as e:
-            print("Writer error:", e)
+            # Canale Time (secondi)
             try:
-                _close_segment()
-            except Exception:
-                pass
+                chans.append(ChannelObject(
+                    "Acquisition", "Time", t_rel, properties={
+                        "unit_string": "s",
+                        "wf_start_time": datetime.datetime.fromtimestamp(_seg_start_time_s(seg_start_idx)),
+                        "wf_increment": 1.0 / fs,
+                        "stored_domain": "time",
+                    }
+                ))
+            except Exception as e:
+                print("Writer warning (Time channel):", e)
+
+            # Canali dati
+            num_ch = min(len(tdms_names), block.shape[0])
+            for i in range(num_ch):
+                ui_name = tdms_names[i]
+                try:
+                    phys = self._ai_channels[i] if i < len(self._ai_channels) else f"ai{i}"
+                    meta = self._sensor_map_by_phys.get(phys, {})
+                    sensor_name = meta.get("sensor_name", "Voltage")
+                    unit_eng = meta.get("unit", "") if sensor_name != "Voltage" else "V"
+                    a = float(meta.get("a", 1.0))
+                    b = float(meta.get("b", 0.0))
+                    baseline = self._zero.get(phys, None)
+
+                    raw = np.ascontiguousarray(block[i])  # Volt
+                    if baseline is not None:
+                        raw = raw - float(baseline)
+                    data_eng = a * raw + b
+                    zero_eng = (a * float(baseline)) if (baseline is not None) else 0.0
+
+                    props = {
+                        "description": sensor_name,
+                        "unit_string": unit_eng,
+                        "wf_start_time": datetime.datetime.fromtimestamp(_seg_start_time_s(seg_start_idx)),
+                        "wf_increment": 1.0 / fs,
+                        "physical_channel": phys,
+                        "scale_a": a,
+                        "scale_b": b,
+                        "zero_applied": float(zero_eng),
+                    }
+                    chans.append(ChannelObject("Acquisition", ui_name, data_eng, properties=props))
+                except Exception as e:
+                    print(f"Writer warning (data channel {i}):", e)
+
+            try:
+                writer.write_segment([root, group] + chans)
+            except Exception as e:
+                print("Writer error (write_segment):", e)
+
+
 
     # -------------------- Cleanup --------------------
     def _cleanup(self):
@@ -731,8 +682,14 @@ class AcquisitionManager:
             return
         # allunga se serve
         if len(self._channel_names) < len(self._ai_channels):
-            self._channel_names = (self._channel_names + self._ai_channels)[ : len(self._ai_channels) ]
+            self._channel_names = (self._channel_names + self._ai_channels)[:len(self._ai_channels)]
         self._channel_names[idx] = ui_name or phys
+        # normalizza subito (dedup + sanificazione)
+        try:
+            self._channel_names = self._unique_tdms_names(self._channel_names)
+        except Exception:
+            pass
+
 
     def set_channel_labels(self, ordered_ui_names: list[str]):
         """Sostituisce l'elenco completo di nomi canale TDMS nell'ordine corrente."""
@@ -741,3 +698,67 @@ class AcquisitionManager:
             self._channel_names = self._ai_channels[:]
         else:
             self._channel_names = (ordered_ui_names + self._ai_channels)[:n]
+        # normalizza (dedup + sanificazione)
+        try:
+            self._channel_names = self._unique_tdms_names(self._channel_names)
+        except Exception:
+            pass
+    
+        def _sanitize_tdms_basename(self, name: str) -> str:
+            """
+            Sanifica un'etichetta utente per l'uso come nome canale TDMS.
+            - Rimuove caratteri problematici (/ \ : * ? " < > |)
+            - Normalizza spazi
+            - Evita stringhe vuote
+            """
+            try:
+                s = (name or "").strip()
+                if not s:
+                    return "chan"
+                bad = '/\\:*?"<>|'
+                for ch in bad:
+                    s = s.replace(ch, "_")
+                s = " ".join(s.split())          # comprime spazi multipli
+                return s[:128] if s else "chan"  # limite prudente
+            except Exception:
+                return "chan"
+
+        def _unique_tdms_names(self, ui_names: list[str]) -> list[str]:
+            """
+            Ritorna nomi TDMS sanificati e univoci nel contesto corrente.
+            - Riserva 'Time' per il canale temporale
+            - Mantiene l'ordine
+            - Aggiunge suffissi _2, _3, ... se necessario
+            """
+            unique = []
+            used = set(["Time"])  # 'Time' è riservato
+            counters = {}
+            for raw in (ui_names or []):
+                base = self._sanitize_tdms_basename(raw)
+                if base in used:
+                    n = counters.get(base, 1) + 1
+                    counters[base] = n
+                    cand = f"{base}_{n}"
+                    while cand in used:
+                        n += 1
+                        counters[base] = n
+                        cand = f"{base}_{n}"
+                    name = cand
+                else:
+                    used.add(base)
+                    counters.setdefault(base, 1)
+                    name = base
+                unique.append(name)
+            return unique
+
+        def _current_tdms_names(self) -> list[str]:
+            """
+            Costruisce l'elenco dei nomi TDMS effettivi da usare ORA
+            partendo dalle etichette UI (fallback: nomi fisici).
+            """
+            try:
+                src = self._channel_names or self._ai_channels
+                return self._unique_tdms_names(list(src))
+            except Exception:
+                # fallback estremo: nomi fisici così come sono
+                return list(self._ai_channels)
