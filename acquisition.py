@@ -40,7 +40,8 @@ class AcquisitionManager:
         self.sample_rate = float(sample_rate)
         self.callback_chunk = int(callback_chunk)
         self.rotate_seconds = int(rotate_seconds)
-
+        self._closing = False            # vero durante stop/chiusura
+        self._cb_registered = False      # abbiamo registrato l'Every N Samples?
         self.current_rate_hz: Optional[float] = None
         self.current_agg_rate_hz: Optional[float] = None
         self.max_single_rate_hz: Optional[float] = None
@@ -282,6 +283,7 @@ class AcquisitionManager:
             self._task.register_every_n_samples_acquired_into_buffer_event(
                 self.callback_chunk, self._on_every_n_samples
             )
+            self._cb_registered = True
 
             # --- writer thread ---
             self._writer_stop.clear()
@@ -302,9 +304,15 @@ class AcquisitionManager:
             return False
 
     def stop(self):
-        """Stop immediato (può perdere gli ultimissimi ms nel buffer driver)."""
+        """Stop immediato: deregistra il callback PRIMA di fermare/chiudere il task."""
+        self._closing = True
         self._running = False
         self.set_recording(False)
+
+        # stacca il callback per evitare chiamate mentre chiudiamo
+        self._unregister_callbacks()
+        time.sleep(0.01)  # piccolo respiro per drenare callback in volo
+
         try:
             if self._task:
                 self._task.stop()
@@ -316,39 +324,41 @@ class AcquisitionManager:
         except Exception:
             pass
         self._task = None
+
+        # chiusura writer
         self._writer_stop.set()
         self._recording_toggle.set()
         if self._writer_thread and self._writer_thread.is_alive():
             self._writer_thread.join(timeout=10)
         self._writer_thread = None
+        self._closing = False
 
     def stop_graceful(self, wait_ms: int = 150):
         """
-        Stop con garanzia di salvataggio fino all'istante di chiamata:
-          1) breve attesa per scaricare i callback in volo
-          2) lettura sincrona di TUTTI i campioni residui nel buffer driver
-          3) accodo con indice globale corretto
-          4) flush finale del writer
+        Stop con salvataggio completo fino all'istante di chiamata.
         """
-        if self._task is None:
-            # chiusura solo writer
-            self._running = False
-            self.set_recording(False)
-            self._writer_stop.set()
-            self._recording_toggle.set()
-            if self._writer_thread and self._writer_thread.is_alive():
-                self._writer_thread.join(timeout=10)
-            self._writer_thread = None
-            return
-
+        self._closing = True
         try:
-            self.set_recording(True)  # assicura che il writer salvi il residuo
+            if self._task is None:
+                # solo writer
+                self._running = False
+                self.set_recording(False)
+                self._writer_stop.set()
+                self._recording_toggle.set()
+                if self._writer_thread and self._writer_thread.is_alive():
+                    self._writer_thread.join(timeout=10)
+                self._writer_thread = None
+                return
 
+            # assicura writer attivo per salvare il residuo
+            self.set_recording(True)
+
+            # breve attesa per permettere agli ultimi callback di enqueue-are
             t0 = time.time()
             while (time.time() - t0) * 1000.0 < wait_ms:
                 time.sleep(0.005)
 
-            # drena buffer hardware
+            # drena il buffer hardware con lettura sincrona finché ci sono campioni
             try:
                 avail = int(self._task.in_stream.avail_samp_per_chan)
             except Exception:
@@ -356,6 +366,7 @@ class AcquisitionManager:
             while avail and avail > 0:
                 nch = len(self._ai_channels)
                 buf = np.empty((nch, avail), dtype=np.float64)
+                # NB: leggiamo prima di deregistrare il callback
                 self._reader.read_many_sample(buf, avail, timeout=1.0)
                 start_idx = self._global_samples
                 self._global_samples += avail
@@ -368,31 +379,42 @@ class AcquisitionManager:
                 except Exception:
                     break
 
-            # chiudi segmento parziale
+            # da qui in poi non vogliamo più callback
+            self._unregister_callbacks()
+            time.sleep(0.01)
+
+            # chiudi il segmento parziale
             self.set_recording(False)
             self._recording_toggle.set()
 
         finally:
+            # ferma e chiudi il task
             try:
                 self._running = False
-                self._task.stop()
+                if self._task:
+                    self._task.stop()
             except Exception:
                 pass
             try:
-                self._task.close()
+                if self._task:
+                    self._task.close()
             except Exception:
                 pass
             self._task = None
 
+            # chiudi writer
             self._writer_stop.set()
             self._recording_toggle.set()
             if self._writer_thread and self._writer_thread.is_alive():
                 self._writer_thread.join(timeout=10)
             self._writer_thread = None
+            self._closing = False
+
 
     # -------------------- Callback DAQ --------------------
     def _on_every_n_samples(self, task_handle, every_n_samples_event_type, number_of_samples, callback_data):
-        if not self._running:
+        # Uscita rapida se stiamo chiudendo o il task/reader non è più valido
+        if (not self._running) or self._closing or (self._task is None) or (self._reader is None):
             return 0
         try:
             nch = len(self._ai_channels)
@@ -477,15 +499,22 @@ class AcquisitionManager:
             writer = TdmsWriter(open(open_file_path, "wb"))
 
         def _close_segment():
-            nonlocal writer, open_file_path
+            nonlocal writer, open_file_path, seg_written
             if writer:
                 try:
                     writer.close()
                 except Exception:
                     pass
-                writer = None
-                open_file_path = None
-
+                # elimina segmenti senza campioni
+                try:
+                    if (seg_written or 0) <= 0 and open_file_path and os.path.isfile(open_file_path):
+                        os.remove(open_file_path)
+                except Exception:
+                    pass
+            writer = None
+            open_file_path = None
+            seg_written = 0
+            
         def _write_miniseg(start_idx_in_file: int, block: np.ndarray):
             """
             Scrive un mini-segmento nel file corrente.
@@ -565,43 +594,16 @@ class AcquisitionManager:
             while not self._writer_stop.is_set():
                 # Non in registrazione → drena eventuali dati e chiudi segmento
                 if not self._recording_enabled:
-                    drained = False
+                    # Non in registrazione → NON scriviamo nulla.
+                # Dreniamo soltanto la coda per non accumulare RAM e chiudiamo eventuale file aperto.
+                    _close_segment()
                     while True:
                         try:
-                            start_idx, buf = self._queue.get_nowait()
-                            if writer is None:
-                                _open_segment(start_idx)
-                            # split su confine file; scrivi subito i mini-segmenti
-                            block_idx = start_idx
-                            block = buf
-                            while block.shape[1] > 0:
-                                if seg_start_idx is None:
-                                    _open_segment(block_idx)
-                                expected = (seg_start_idx + seg_written) if seg_start_idx is not None else block_idx
-                                if block_idx != expected:
-                                    _close_segment()
-                                    _open_segment(block_idx)
-
-                                remaining_file = seg_target_samples - seg_written
-                                if remaining_file <= 0:
-                                    _close_segment()
-                                    _open_segment(block_idx)
-
-                                take = min(remaining_file, block.shape[1])
-                                part = block[:, :take]
-                                _write_miniseg(seg_written, part)
-                                seg_written += take
-
-                                if seg_written >= seg_target_samples:
-                                    _close_segment()
-                                    _open_segment(block_idx + take)
-
-                                block_idx += take
-                                block = block[:, take:]
-                            drained = True
+                            _ = self._queue.get_nowait()
+                            # scarta il blocco
                         except queue.Empty:
                             break
-                    _close_segment()
+                    # attendi il toggle di registrazione o un breve timeout
                     self._recording_toggle.wait(timeout=0.2)
                     self._recording_toggle.clear()
                     continue
@@ -708,4 +710,34 @@ class AcquisitionManager:
         if baseline is not None:
             raw = raw - float(baseline)
         return a * raw + b
+    def _unregister_callbacks(self):
+        """Rimuove il callback Every N Samples dal task in modo sicuro."""
+        try:
+            if self._task and self._cb_registered:
+                # In nidaqmx si deregistra passando callback=None
+                self._task.register_every_n_samples_acquired_into_buffer_event(
+                    self.callback_chunk, None
+                )
+        except Exception:
+            pass
+        self._cb_registered = False
+        self._reader = None
+    # --- Aggiornamento etichette canali dal lato UI ---
+    def set_ui_name_for_phys(self, phys: str, ui_name: str):
+        """Aggiorna il nome canale TDMS associato al canale fisico."""
+        try:
+            idx = self._ai_channels.index(phys)
+        except ValueError:
+            return
+        # allunga se serve
+        if len(self._channel_names) < len(self._ai_channels):
+            self._channel_names = (self._channel_names + self._ai_channels)[ : len(self._ai_channels) ]
+        self._channel_names[idx] = ui_name or phys
 
+    def set_channel_labels(self, ordered_ui_names: list[str]):
+        """Sostituisce l'elenco completo di nomi canale TDMS nell'ordine corrente."""
+        n = len(self._ai_channels)
+        if not ordered_ui_names:
+            self._channel_names = self._ai_channels[:]
+        else:
+            self._channel_names = (ordered_ui_names + self._ai_channels)[:n]

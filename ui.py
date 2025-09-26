@@ -178,6 +178,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.statusBar = QtWidgets.QStatusBar()
         self.setStatusBar(self.statusBar)
         self.lblRateInfo = QtWidgets.QLabel("—")
+        our_font = self.lblRateInfo.font()
+        our_font.setPointSize(9)
+        self.lblRateInfo.setFont(our_font)
         self.statusBar.addPermanentWidget(self.lblRateInfo)
 
     def _connect_signals(self):
@@ -189,8 +192,18 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.btnClearChart.clicked.connect(self._clear_chart)
         self.btnDefineTypes.clicked.connect(self._open_resource_manager)
 
-        # tabella
+        # tabella: prima puliamo eventuali collegamenti generici che
+        # potrebbero riconfigurare anche quando si rinomina
+        try:
+            self.table.cellChanged.disconnect()
+        except Exception:
+            pass
+        try:
+            self.table.itemChanged.disconnect()
+        except Exception:
+            pass
         self.table.itemChanged.connect(self._on_table_item_changed)
+
         self.cmbDevice.currentIndexChanged.connect(self._on_device_changed)
 
         # callback dal core (rimappati in segnali Qt)
@@ -453,19 +466,54 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._rebuild_legends()
         self._push_sensor_map_to_core()
 
+    def _push_channel_labels_to_core(self):
+        """Invia al core i nomi canale (per ogni riga della tabella)."""
+        n = self.table.rowCount()
+        for r in range(n):
+            phys = self.table.item(r, COL_PHYS).text() if self.table.item(r, COL_PHYS) else ""
+            lbl_item = self.table.item(r, COL_LABEL)
+            label = lbl_item.text().strip() if lbl_item else ""
+            if not label:
+                label = phys
+            try:
+                self.acq.set_ui_name_for_phys(phys, label)
+            except Exception:
+                pass
+
     def _on_table_item_changed(self, item: QtWidgets.QTableWidgetItem):
+        if item is None:
+            return
+
+        # evita rientri durante build/aggiornamenti programmatici
         if self._building_table or self._auto_change:
             return
-        r, c = item.row(), item.column()
-        if c == COL_ENABLE:
-            self._update_acquisition_from_table()
-        elif c == COL_LABEL:
-            phys = self.table.item(r, COL_PHYS).text().strip()
-            self._label_by_phys[phys] = item.text().strip() or phys
+
+        row = item.row()
+        col = item.column()
+
+        if col == COL_LABEL:
+            # --- Rinominare NON deve toccare l'acquisizione ---
+            phys = self.table.item(row, COL_PHYS).text().strip() if self.table.item(row, COL_PHYS) else ""
+            new_label = (item.text() or "").strip() or phys
+
+            # aggiorna mapping locale e legenda
+            self._label_by_phys[phys] = new_label
             self._rebuild_legends()
-            self._push_sensor_map_to_core()
+
+            # invia subito al core (per TDMS)
+            try:
+                self.acq.set_ui_name_for_phys(phys, new_label)
+            except Exception:
+                pass
+
+            # opzionale: aggiorna label rate se stai acquisendo
             if self.btnStop.isEnabled():
                 self._update_rate_label(self._current_phys_order)
+            return  # <— importante: NON proseguire
+
+        # altri casi che possono richiedere riconfigurazione
+        if col == COL_ENABLE:
+            self._update_acquisition_from_table()
 
     def _enabled_phys_and_labels(self):
         phys, labels = [], []
@@ -584,6 +632,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         subdir = os.path.join(base_dir, subdir_name)
         os.makedirs(subdir, exist_ok=True)
 
+        # invia i nomi canale al core (per ogni riga della tabella)
+        self._push_channel_labels_to_core()
         self.acq.set_output_directory(subdir)
         self.acq.set_recording(True)
 
@@ -592,6 +642,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._base_filename = base_name
 
         self._set_table_lock(True)
+
         # countdown
         self._countdown = 60
         self._update_start_button_text()
@@ -603,8 +654,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.btnBrowseDir.setEnabled(False)
         self.txtBaseName.setEnabled(False)
         self.btnStart.setEnabled(False)
-        
-        
 
     def _tick_countdown(self):
         if not self.acq.recording_enabled:
@@ -623,7 +672,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def _on_stop(self):
         # ferma core
         try:
-            #self.acq.set_recording(False)
             self.acq.stop_graceful()
         except Exception:
             pass
@@ -658,8 +706,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Errore ricomposizione", str(e))
         finally:
             self._active_subdir = None
+
         self._set_table_lock(False)
         self._uncheck_all_enabled()
+
     # ----------------------------- Grafici -----------------------------
     def _reset_plots(self):
         self._chart_x.clear()
@@ -843,7 +893,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
-    
+
     def _on_zero_button_clicked(self, phys: str):
         """
         Azzeramento canale:
@@ -877,6 +927,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 self.acq.set_zero_raw(phys, last_raw)
         except Exception:
             pass
+
     def _set_row_bg(self, row: int, col: int, color: QtGui.QColor):
         item = self.table.item(row, col)
         if item is None:
@@ -928,7 +979,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
             # --- Valore istantaneo (display only; solo colore) ---
             self._set_row_bg(r, COL_VALUE, gray if lock else white)
-
 
     def _uncheck_all_enabled(self):
         """Rimuove tutte le spunte 'Abilita' (senza scatenare ricalcoli ripetuti)."""
