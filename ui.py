@@ -633,8 +633,19 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         os.makedirs(subdir, exist_ok=True)
 
         # invia i nomi canale al core (per ogni riga della tabella)
+        # send channel labels and configure base filename for TDMS segments
         self._push_channel_labels_to_core()
+        # reset any residual in‑memory blocks before changing the output directory
+        try:
+            if hasattr(self.acq, "clear_memory_buffer"):
+                self.acq.clear_memory_buffer()
+        except Exception:
+            pass
+        # prepare a fresh output directory
         self.acq.set_output_directory(subdir)
+        # set base filename (without extension) for naming the TDMS segments
+        self.acq.set_base_filename(base_name)
+        # enable recording so the writer will start accumulating blocks in RAM
         self.acq.set_recording(True)
 
         self._active_subdir = subdir
@@ -643,11 +654,17 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         self._set_table_lock(True)
 
-        # countdown
-        self._countdown = 60
-        self._update_start_button_text()
+        # Reset and start memory usage timer for updating the save button text
         if not self._count_timer.isActive():
             self._count_timer.start()
+        # Immediately update the button text with memory usage
+        try:
+            used, limit = self.acq.get_memory_usage()
+            mb = used / (1024 * 1024)
+            total_mb = limit / (1024 * 1024)
+            self.btnStart.setText(f"Salvataggio ({mb:.1f} / {total_mb:.0f} MB)")
+        except Exception:
+            self.btnStart.setText("Salvataggio (0 / 500 MB)")
 
         # blocca i campi
         self.txtSaveDir.setEnabled(False)
@@ -656,15 +673,20 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.btnStart.setEnabled(False)
 
     def _tick_countdown(self):
+        # Update the save button text with current memory usage while recording
         if not self.acq.recording_enabled:
             self._count_timer.stop()
             self.btnStart.setText("Salva dati")
             self.btnStart.setEnabled(True)
             return
-        self._countdown -= 1
-        if self._countdown <= 0:
-            self._countdown = 60
-        self._update_start_button_text()
+        # Query memory usage from the acquisition manager
+        try:
+            used_bytes, limit_bytes = self.acq.get_memory_usage()
+            used_mb = used_bytes / (1024 * 1024)
+            total_mb = limit_bytes / (1024 * 1024)
+            self.btnStart.setText(f"Salvataggio ({used_mb:.1f} / {total_mb:.0f} MB)")
+        except Exception:
+            self.btnStart.setText("Salvataggio")
 
     def _update_start_button_text(self):
         self.btnStart.setText(f"Salvo in ({self._countdown:02d} s) …")
@@ -698,11 +720,34 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             return
 
         final_path = os.path.join(self._save_dir, self._base_filename)
+        # Merge the temporary TDMS files into the final file with progress feedback
         try:
             from tdms_merge import TdmsMerger
-            TdmsMerger().merge_temp_tdms(self._active_subdir, final_path)
+            merger = TdmsMerger()
+            # Progress dialog
+            dlg = QtWidgets.QProgressDialog("Unione file TDMS in corso…", "Annulla", 0, 1, self)
+            dlg.setWindowTitle("Unione in corso")
+            dlg.setWindowModality(QtCore.Qt.WindowModal)
+            dlg.setValue(0)
+            # Define progress callback
+            def _merge_progress(curr: int, total: int):
+                try:
+                    dlg.setMaximum(total)
+                    dlg.setValue(curr)
+                    QtWidgets.QApplication.processEvents()
+                    if dlg.wasCanceled():
+                        raise RuntimeError("Operazione di unione annullata dall'utente.")
+                except Exception:
+                    pass
+            # Perform merge with progress callback
+            merger.merge_temp_tdms(self._active_subdir, final_path, progress_cb=_merge_progress)
+            dlg.close()
             QtWidgets.QMessageBox.information(self, "Completato", f"TDMS finale creato:\n{final_path}")
         except Exception as e:
+            try:
+                dlg.close()
+            except Exception:
+                pass
             QtWidgets.QMessageBox.critical(self, "Errore ricomposizione", str(e))
         finally:
             self._active_subdir = None
@@ -730,12 +775,19 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     def _reset_plots_curves(self):
         self._reset_plots()
-        for phys in self._current_phys_order:
+        # Assign distinct colors to each channel for better readability
+        num_ch = max(1, len(self._current_phys_order))
+        for idx, phys in enumerate(self._current_phys_order):
             unit = self._calib_by_phys.get(phys, {}).get("unit", "")
             base_label = self._label_by_phys.get(phys, phys)
             label = f"{base_label} [{unit}]" if unit else base_label
-
-            c = self.pgChart.plot(name=label)
+            # Use a distinct color based on the index; pg.intColor returns a QColor
+            try:
+                color = pg.intColor(idx, hues=max(8, num_ch))
+            except Exception:
+                color = (255, 0, 0)  # fallback to red
+            # Chart (concatenated)
+            c = self.pgChart.plot(name=label, pen=pg.mkPen(color=color, width=1.5))
             try:
                 c.setClipToView(True)
                 c.setDownsampling(auto=True, mode='peak')
@@ -743,8 +795,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 pass
             self._chart_curves_by_phys[phys] = c
             self._chart_legend.addItem(c, label)
-
-            ic = self.pgInstant.plot(name=label)
+            # Instant block plot
+            ic = self.pgInstant.plot(name=label, pen=pg.mkPen(color=color, width=1.5))
             try:
                 ic.setClipToView(True)
                 ic.setDownsampling(auto=True, mode='peak')

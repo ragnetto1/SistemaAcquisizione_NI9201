@@ -2,6 +2,7 @@ import os
 import datetime
 import numpy as np
 from nptdms import TdmsFile, TdmsWriter, RootObject, GroupObject, ChannelObject
+from typing import Optional, Callable
 
 
 def _to_py_datetime(x):
@@ -61,7 +62,7 @@ class TdmsMerger:
         return segs
 
     # -------------------- API --------------------
-    def merge_temp_tdms(self, folder: str, out_path: str):
+    def merge_temp_tdms(self, folder: str, out_path: str, progress_cb: Optional[Callable[[int, int], None]] = None):
         if not os.path.isdir(folder):
             raise RuntimeError(f"Cartella segmenti non trovata: {folder}")
 
@@ -80,7 +81,10 @@ class TdmsMerger:
         fs = None                       # frequenza di campionamento (1 / wf_increment)
 
         # --------------- Scansione segmenti ---------------
+        total_segs = len(segs)
+        curr_seg = 0
         for path in segs:
+            curr_seg += 1
             try:
                 td = TdmsFile.read(path)
             except Exception:
@@ -183,6 +187,12 @@ class TdmsMerger:
                     except Exception:
                         props_cache[nm] = {}
 
+            # progress update callback
+            if progress_cb:
+                try:
+                    progress_cb(curr_seg, total_segs)
+                except Exception:
+                    pass
         # --------------- Validazioni e fallback ---------------
         if ch_names is None:
             raise RuntimeError("Nessun canale valido trovato nei segmenti.")

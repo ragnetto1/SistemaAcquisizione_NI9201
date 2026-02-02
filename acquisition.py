@@ -74,6 +74,18 @@ class AcquisitionManager:
         self._recording_enabled = False
         self._recording_toggle = threading.Event()
 
+        # --- Memory-based saving attributes ---
+        # Maximum memory allowed for accumulating blocks before flushing to disk
+        self._memory_limit_bytes: int = 500 * 1024 * 1024  # 500 MB
+        # List of tuples (global_start_index, numpy_array) representing blocks in memory
+        self._memory_blocks: List[Tuple[int, np.ndarray]] = []
+        # Current memory usage in bytes for accumulated blocks
+        self._memory_bytes: int = 0
+        # Counter used to increment output filenames (00001, 00002, ...)
+        self._file_counter: int = 0
+        # Base filename (without extension) used when saving TDMS segments
+        self._base_filename_no_ext: str = "Seg"
+
         # Callback UI
         self.on_channel_value: Optional[Callable[[str, float], None]] = None
         self.on_new_instant_block: Optional[Callable[[np.ndarray, List[np.ndarray], List[str]], None]] = None
@@ -105,6 +117,45 @@ class AcquisitionManager:
         self._recording_enabled = bool(enable)
         if prev != self._recording_enabled:
             self._recording_toggle.set()
+
+    # -------------------- Filename and memory API --------------------
+    def set_base_filename(self, base_name: str):
+        """
+        Set the base filename (without extension) used for naming TDMS segments.
+        When called, the internal file counter is reset so numbering restarts
+        from 00001.
+        """
+        if base_name:
+            # Remove any extension and keep only the basename
+            bn = os.path.splitext(os.path.basename(base_name))[0]
+            if bn:
+                self._base_filename_no_ext = bn
+                self._file_counter = 0
+
+    def get_memory_usage(self) -> Tuple[int, int]:
+        """
+        Returns a tuple (used_bytes, limit_bytes) representing the current
+        accumulated memory and the configured threshold. The UI can use
+        this information to display progress.
+        """
+        return (self._memory_bytes, self._memory_limit_bytes)
+
+    def clear_memory_buffer(self) -> None:
+        """
+        Clears any accumulated blocks and resets the memory usage counter.
+
+        This should be invoked before starting a new recording session to
+        ensure that no leftover samples from a previous session are flushed
+        to disk. It does not affect the underlying acquisition queue.
+        """
+        try:
+            # Empty the list of blocks
+            self._memory_blocks.clear()
+        except Exception:
+            # Fall back to assignment if clear is not available
+            self._memory_blocks = []
+        # Reset the byte counter
+        self._memory_bytes = 0
 
     def zero_channel(self, chan_name: str):
         self._zero[chan_name] = None  # al prossimo giro memorizza come zero
@@ -261,7 +312,8 @@ class AcquisitionManager:
             MEMORY_BUDGET_MB = 256
             blocks_mem = max(50, int((MEMORY_BUDGET_MB * 1024 * 1024) / max(1, bytes_per_block)))
             queue_capacity = min(blocks_target, blocks_mem)
-            self._queue = queue.Queue(maxsize=queue_capacity)
+            # Use an unbounded queue to avoid dropping data while accumulating in memory
+            self._queue = queue.Queue(maxsize=0)
 
             # --- reset timing globale ---
             self._t0_epoch_s = None
@@ -490,15 +542,28 @@ class AcquisitionManager:
                     print("Callback warning: queue full; dropped block (also dropped_oldest=%d)" % dropped_old)
 
             # feed grafico (nomi di start, tempo corretto)
+            # Apply zero offsets to each channel before sending data to the UI
             if self.on_new_instant_block or self.on_new_chart_points:
                 fs = float(self.current_rate_hz or 1.0)
                 t0 = (self._t0_epoch_s or 0.0) + (start_idx / fs)
+                # generate time vector for this block
                 t = t0 + np.arange(number_of_samples, dtype=np.float64) / fs
-                ys = [buf[i, :] for i in range(nch)]
+                # build list of per-channel data arrays applying zero offset
+                ys_corr: List[np.ndarray] = []
+                for i, ch in enumerate(self._ai_channels):
+                    try:
+                        data = buf[i, :]
+                        baseline = self._zero.get(ch, None)
+                        if baseline is not None:
+                            data = data - float(baseline)
+                        # ensure contiguous array for PyQtGraph
+                        ys_corr.append(np.ascontiguousarray(data))
+                    except Exception:
+                        ys_corr.append(np.ascontiguousarray(buf[i, :]))
 
                 if self.on_new_instant_block:
                     try:
-                        self.on_new_instant_block(t, ys, start_names)
+                        self.on_new_instant_block(t, ys_corr, start_names)
                     except Exception as e:
                         print("Callback warning (instant_block):", e)
 
@@ -508,7 +573,9 @@ class AcquisitionManager:
                         if dec_step <= 0:
                             dec_step = 1
                         dec = slice(None, None, dec_step)
-                        self.on_new_chart_points(t[dec], [y[dec] for y in ys], start_names)
+                        t_dec = t[dec]
+                        ys_dec = [y[dec] for y in ys_corr]
+                        self.on_new_chart_points(t_dec, ys_dec, start_names)
                     except Exception as e:
                         print("Callback warning (chart_points):", e)
 
@@ -519,264 +586,210 @@ class AcquisitionManager:
 
     # -------------------- Writer TDMS (streaming, no buchi) --------------------
     def _writer_loop(self):
+        """
+        Writer thread that accumulates incoming blocks in memory until a
+        configurable limit (default 500 MB). Once the limit is reached or
+        recording is stopped, the accumulated blocks are flushed to a new
+        TDMS file. This approach guarantees that no samples are lost while
+        providing larger segment files instead of the time‑based rotation.
+        """
+        # Sample rate for time calculations
         fs = float(self.current_rate_hz or 1.0)
-        seg_target_samples = max(1, int(self.rotate_seconds * fs))
 
-        # mini-scrittura (streaming) per RAM costante
-        MIN_WRITE_SEC = 0.2
-        mini_target_samples = max(1, int(MIN_WRITE_SEC * fs))
-
-        writer: Optional[TdmsWriter] = None
-        seg_start_idx: Optional[int] = None        # indice globale del primo campione del file corrente
-        seg_written: int = 0                       # campioni già scritti nel file corrente
-        open_file_path: Optional[str] = None
-
-        def _seg_start_time_s(idx: int) -> float:
-            t0 = float(self._t0_epoch_s or time.time())
-            return t0 + (idx / fs)
-
-        def _open_segment(idx0: int):
-            nonlocal writer, seg_start_idx, seg_written, open_file_path
-            _close_segment()
-            seg_start_idx = int(idx0)
-            seg_written = 0
-            start_s = _seg_start_time_s(seg_start_idx)
-            fname = f"segment_{int(start_s*1e9)}.tdms"
-            open_file_path = os.path.join(self.temp_dir, fname)
-            writer = TdmsWriter(open(open_file_path, "wb"))
-
-        def _close_segment():
-            nonlocal writer, open_file_path, seg_written
-            if writer:
-                try:
-                    writer.close()
-                except Exception:
-                    pass
-                # elimina segmenti senza campioni
-                try:
-                    if (seg_written or 0) <= 0 and open_file_path and os.path.isfile(open_file_path):
-                        os.remove(open_file_path)
-                except Exception:
-                    pass
-            writer = None
-            open_file_path = None
-            seg_written = 0
-
-        def _write_miniseg(start_idx_in_file: int, block: np.ndarray):
+        # Helper to flush accumulated blocks to disk
+        def flush_memory():
             """
-            Scrive un mini-segmento nel file corrente.
-            - Il canale "Time" è continuo nel file: t = offset_in_file + arange(n)/fs
-            - I dati sono salvati in unità ingegneristiche (Valore istantaneo).
-            - Nomi canale TDMS: sanificati, deduplicati e con 'Time' riservato.
+            Writes all accumulated blocks to a new TDMS file and clears the
+            in‑memory buffer. Blocks are sorted by their global start index
+            to maintain chronological order. Each block is written as a
+            mini‑segment with appropriate metadata.
             """
-            # Pre-condizioni minime
-            if writer is None or seg_start_idx is None:
+            # Capture reference for local scope
+            nonlocal fs
+            # Nothing to flush
+            if not self._memory_blocks:
                 return
             try:
-                n = int(block.shape[1])
-            except Exception:
-                return
-            if n <= 0:
-                return
-
-            # 1) Nomi TDMS effettivi, sanificati e univoci
-            try:
-                tdms_names = list(self._current_tdms_names())
+                # Sort blocks by global start index
+                blocks_sorted = sorted(self._memory_blocks, key=lambda x: x[0])
+                seg_start_idx = blocks_sorted[0][0]
+                # Determine absolute start time for the earliest sample
+                t0_epoch = float(self._t0_epoch_s or time.time())
+                start_time_epoch_s = t0_epoch + (seg_start_idx / fs)
+                # Determine filename; reset counter if negative
+                self._file_counter += 1
+                base = self._base_filename_no_ext or "segment"
+                fname = f"{base}_{self._file_counter:05d}.tdms"
+                out_path = os.path.join(self.temp_dir, fname)
+                # Open writer
+                with TdmsWriter(open(out_path, "wb")) as writer:
+                    # Write each block as a mini‑segment
+                    for (blk_start_idx, buf) in blocks_sorted:
+                        # Compute starting offset within this file
+                        start_in_file = int(blk_start_idx - seg_start_idx)
+                        # Validate block shape
+                        try:
+                            n = int(buf.shape[1])
+                        except Exception:
+                            continue
+                        if n <= 0:
+                            continue
+                        # Build list of TDMS channel names (sanitized and deduplicated)
+                        try:
+                            tdms_names = list(self._current_tdms_names())
+                        except Exception:
+                            tdms_names = list(self._ai_channels)
+                        # Extend names if there are more channels than names
+                        try:
+                            if len(tdms_names) < buf.shape[0]:
+                                used = set(["Time"]) | set(tdms_names)
+                                for i in range(len(tdms_names), buf.shape[0]):
+                                    base_nm = self._sanitize_tdms_basename(
+                                        self._ai_channels[i] if i < len(self._ai_channels) else f"ai{i}"
+                                    )
+                                    name = base_nm
+                                    k = 2
+                                    while name in used:
+                                        name = f"{base_nm}_{k}"
+                                        k += 1
+                                    tdms_names.append(name)
+                                    used.add(name)
+                        except Exception:
+                            pass
+                        # Compute relative time vector for this mini‑segment
+                        try:
+                            t_rel = (start_in_file / fs) + (np.arange(n, dtype=np.float64) / fs)
+                        except Exception:
+                            continue
+                        # Root and group objects
+                        try:
+                            root = RootObject(properties={
+                                "sample_rate": fs,
+                                "channels": ",".join(tdms_names),
+                                "start_index": int(seg_start_idx),
+                                "chunk_offset": int(start_in_file),
+                                "start_time_epoch_s": float(start_time_epoch_s),
+                            })
+                            group = GroupObject("Acquisition")
+                        except Exception:
+                            continue
+                        # Channels: build Time channel
+                        channels = []
+                        try:
+                            channels.append(ChannelObject(
+                                "Acquisition", "Time", t_rel, properties={
+                                    "unit_string": "s",
+                                    "wf_start_time": datetime.datetime.fromtimestamp(start_time_epoch_s),
+                                    "wf_increment": 1.0 / fs,
+                                    "stored_domain": "time",
+                                }
+                            ))
+                        except Exception:
+                            pass
+                        # Data channels
+                        try:
+                            num_ch = min(len(tdms_names), buf.shape[0])
+                            for i in range(num_ch):
+                                ui_name = tdms_names[i]
+                                try:
+                                    phys = self._ai_channels[i] if i < len(self._ai_channels) else f"ai{i}"
+                                    meta = self._sensor_map_by_phys.get(phys, {})
+                                    sensor_name = meta.get("sensor_name", "Voltage")
+                                    unit_eng = meta.get("unit", "") if sensor_name != "Voltage" else "V"
+                                    # Calibration coefficients
+                                    a = self._to_float(meta.get("a", 1.0), 1.0)
+                                    b = self._to_float(meta.get("b", 0.0), 0.0)
+                                    # Apply zero offset
+                                    raw = np.ascontiguousarray(buf[i])  # volts
+                                    baseline = self._zero.get(phys, None)
+                                    zero_eng = 0.0
+                                    if baseline is not None:
+                                        try:
+                                            raw = raw - float(baseline)
+                                            zero_eng = a * float(baseline)
+                                        except Exception:
+                                            zero_eng = 0.0
+                                    # Convert to engineered units
+                                    data_eng = a * raw + b
+                                    # Properties for this channel
+                                    props = {
+                                        "description": sensor_name,
+                                        "unit_string": unit_eng,
+                                        "wf_start_time": datetime.datetime.fromtimestamp(start_time_epoch_s),
+                                        "wf_increment": 1.0 / fs,
+                                        "physical_channel": phys,
+                                        "scale_a": a,
+                                        "scale_b": b,
+                                        "zero_applied": float(zero_eng),
+                                    }
+                                    channels.append(ChannelObject("Acquisition", ui_name, data_eng, properties=props))
+                                except Exception as e:
+                                    # Skip problematic channel but continue writing others
+                                    print(f"Writer warning (data channel {i}):", e)
+                        except Exception as e:
+                            print("Writer error (data channels build):", e)
+                        # Write the mini‑segment
+                        try:
+                            writer.write_segment([root, group] + channels)
+                        except Exception as e:
+                            print("Writer error (write_segment):", e)
+                # Clear memory after writing
+                self._memory_blocks.clear()
+                self._memory_bytes = 0
             except Exception as e:
-                print("Writer warning (names map):", e)
-                tdms_names = list(self._ai_channels)
+                print("Writer flush error:", e)
 
-            # Se il numero di canali nel blocco > nomi disponibili, estendi con fallback sicuri
-            try:
-                if len(tdms_names) < block.shape[0]:
-                    used = set(["Time"]) | set(tdms_names)
-                    for i in range(len(tdms_names), block.shape[0]):
-                        base = self._sanitize_tdms_basename(
-                            self._ai_channels[i] if i < len(self._ai_channels) else f"ai{i}"
-                        )
-                        name = base
-                        k = 2
-                        while name in used:
-                            name = f"{base}_{k}"
-                            k += 1
-                        tdms_names.append(name)
-                        used.add(name)
-            except Exception as e:
-                print("Writer warning (extend names):", e)
-
-            # 2) Tempo relativo del mini-segmento
-            try:
-                start_s = _seg_start_time_s(seg_start_idx + start_idx_in_file)
-                t_rel = (start_idx_in_file / fs) + (np.arange(n, dtype=np.float64) / fs)
-            except Exception as e:
-                print("Writer error (time vector):", e)
-                return
-
-            # 3) Oggetti TDMS: root & group
-            try:
-                root = RootObject(properties={
-                    "sample_rate": fs,
-                    "channels": ",".join(tdms_names),
-                    "start_index": int(seg_start_idx),
-                    "chunk_offset": int(start_idx_in_file),
-                    "start_time_epoch_s": float(start_s),
-                })
-                group = GroupObject("Acquisition")
-            except Exception as e:
-                print("Writer error (root/group):", e)
-                return
-
-            # 4) Canali: Time + dati
-            chans = []
-
-            # 4.a) Canale "Time"
-            try:
-                chans.append(ChannelObject(
-                    "Acquisition", "Time", t_rel, properties={
-                        "unit_string": "s",
-                        "wf_start_time": datetime.datetime.fromtimestamp(_seg_start_time_s(seg_start_idx)),
-                        "wf_increment": 1.0 / fs,
-                        "stored_domain": "time",
-                    }
-                ))
-            except Exception as e:
-                print("Writer warning (Time channel):", e)
-
-            # 4.b) Canali dati (ingegnerizzati)
-            try:
-                num_ch = min(len(tdms_names), block.shape[0])
-                for i in range(num_ch):
-                    ui_name = tdms_names[i]
-                    try:
-                        phys = self._ai_channels[i] if i < len(self._ai_channels) else f"ai{i}"
-                        meta = self._sensor_map_by_phys.get(phys, {})
-                        sensor_name = meta.get("sensor_name", "Voltage")
-                        unit_eng = meta.get("unit", "") if sensor_name != "Voltage" else "V"
-
-                        # Cast robusto per a/b
-                        a = self._to_float(meta.get("a", 1.0), 1.0)
-                        b = self._to_float(meta.get("b", 0.0), 0.0)
-
-                        # Applica zero (shift) se presente
-                        raw = np.ascontiguousarray(block[i])  # Volt
-                        baseline = self._zero.get(phys, None)
-                        zero_eng = 0.0
-                        if baseline is not None:
-                            try:
-                                raw = raw - float(baseline)
-                                zero_eng = a * float(baseline)
-                            except Exception:
-                                zero_eng = 0.0
-
-                        # Scala a*x + b → unità ingegneristiche
-                        data_eng = a * raw + b
-
-                        props = {
-                            "description": sensor_name,
-                            "unit_string": unit_eng,
-                            "wf_start_time": datetime.datetime.fromtimestamp(_seg_start_time_s(seg_start_idx)),
-                            "wf_increment": 1.0 / fs,
-                            "physical_channel": phys,
-                            "scale_a": a,
-                            "scale_b": b,
-                            "zero_applied": float(zero_eng),
-                        }
-
-                        chans.append(ChannelObject("Acquisition", ui_name, data_eng, properties=props))
-                    except Exception as e:
-                        # Non fermare l'intero blocco per un singolo canale
-                        print(f"Writer warning (data channel {i}):", e)
-            except Exception as e:
-                print("Writer error (data channels build):", e)
-                # Proseguiamo comunque alla write_segment con i canali costruiti fin qui
-
-            # 5) Scrittura del segmento
-            try:
-                writer.write_segment([root, group] + chans)
-            except Exception as e:
-                # L'errore classico che preveniamo è: "Duplicate object paths found"
-                print("Writer error (write_segment):", e)
-
-        # --------- MAIN LOOP DEL WRITER ---------
         try:
+            # Main loop: accumulate blocks and flush when needed
             while not self._writer_stop.is_set():
-                # Non in registrazione → drena eventuali dati e chiudi segmento
+                # If not recording, flush any residual blocks and drain the queue
                 if not self._recording_enabled:
-                    _close_segment()
-                    # svuota la coda per non accumulare RAM
+                    if self._memory_bytes > 0:
+                        flush_memory()
+                    # Drain the queue to avoid memory build‑up
                     while True:
                         try:
                             _ = self._queue.get_nowait()
                         except queue.Empty:
                             break
-                    # attendi toggle o breve timeout
+                    # Wait for a recording toggle or short timeout
                     self._recording_toggle.wait(timeout=0.2)
                     self._recording_toggle.clear()
                     continue
-
-                # Registrazione attiva → prendi un blocco
+                # Recording active: fetch next block
                 try:
                     start_idx, buf = self._queue.get(timeout=0.2)
                 except queue.Empty:
+                    # No block available: check again soon
                     self._recording_toggle.wait(timeout=0.05)
                     self._recording_toggle.clear()
                     continue
-
-                if writer is None:
-                    _open_segment(start_idx)
-
-                # riallinea se necessario (buco nei campioni)
-                expected = (seg_start_idx + seg_written) if seg_start_idx is not None else start_idx
-                if start_idx != expected:
-                    _close_segment()
-                    _open_segment(start_idx)
-
-                # confine file + scrittura streaming
-                block_idx = start_idx
-                block = buf
-                while block.shape[1] > 0:
-                    remaining_file = seg_target_samples - seg_written
-                    if remaining_file <= 0:
-                        _close_segment()
-                        _open_segment(block_idx)
-                        remaining_file = seg_target_samples
-
-                    take = min(remaining_file, block.shape[1])  # puoi limitare anche con mini_target_samples se vuoi
-                    part = block[:, :take]
-                    _write_miniseg(seg_written, part)
-                    seg_written += take
-
-                    if seg_written >= seg_target_samples:
-                        _close_segment()
-                        _open_segment(block_idx + take)
-
-                    block_idx += take
-                    block = block[:, take:]
-
-            # uscita: drena e chiudi
-            drained_any = False
-            while True:
+                # Accumulate this block into memory
                 try:
-                    start_idx, buf = self._queue.get_nowait()
-                    if writer is None:
-                        _open_segment(start_idx)
-                    expected = (seg_start_idx + seg_written) if seg_start_idx is not None else start_idx
-                    if start_idx != expected:
-                        _close_segment()
-                        _open_segment(start_idx)
-                    _write_miniseg(seg_written, buf)
-                    seg_written += buf.shape[1]
-                    drained_any = True
-                except queue.Empty:
-                    break
-            _close_segment()
-
-        except Exception as e:
-            print("Writer error:", e)
+                    self._memory_blocks.append((start_idx, buf))
+                    # buf.nbytes is total bytes (all channels)
+                    self._memory_bytes += int(buf.nbytes)
+                except Exception:
+                    pass
+                # Flush if memory limit reached or exceeded
+                if self._memory_bytes >= self._memory_limit_bytes:
+                    flush_memory()
+            # On exit: drain any remaining blocks from the queue into memory
             try:
-                _close_segment()
+                while True:
+                    try:
+                        start_idx, buf = self._queue.get_nowait()
+                        self._memory_blocks.append((start_idx, buf))
+                        self._memory_bytes += int(buf.nbytes)
+                    except queue.Empty:
+                        break
             except Exception:
                 pass
+            # Final flush to disk for any residual data
+            if self._memory_bytes > 0:
+                flush_memory()
+        except Exception as e:
+            print("Writer error:", e)
 
     # -------------------- Cleanup --------------------
     def _cleanup(self):
