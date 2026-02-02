@@ -1,5 +1,6 @@
 # ui.py
 from PyQt5 import QtCore, QtWidgets, QtGui
+import shutil  # per rimuovere cartelle temporanee dopo merge
 import pyqtgraph as pg
 from collections import deque
 import numpy as np
@@ -154,6 +155,18 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.txtSaveDir = QtWidgets.QLineEdit(self._save_dir)
         self.btnBrowseDir = QtWidgets.QPushButton("Sfoglia cartella…")
         self.txtBaseName = QtWidgets.QLineEdit(self._base_filename)
+        # SpinBox per impostare la dimensione del buffer in RAM (MB) per il salvataggio
+        self.spinRam = QtWidgets.QSpinBox()
+        # Limiti ragionevoli: da 10 MB fino a 16 GB
+        self.spinRam.setRange(10, 16384)
+        # Valore di default basato sul limite corrente dell'acquisition manager
+        try:
+            _u, _lim = self.acq.get_memory_usage()
+            self.spinRam.setValue(max(1, int(_lim / (1024 * 1024))))
+        except Exception:
+            self.spinRam.setValue(500)
+        self.spinRam.setSuffix(" MB")
+        self.spinRam.setSingleStep(50)
         self.btnStart = QtWidgets.QPushButton("Salva dati")            # passa a “Salvo in (xx s)…”
         self.btnStop = QtWidgets.QPushButton("Stop e ricomponi…")
         self.btnStop.setEnabled(False)
@@ -164,6 +177,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         bottom.addSpacing(12)
         bottom.addWidget(QtWidgets.QLabel("Nome file:"))
         bottom.addWidget(self.txtBaseName)
+        # Controllo per la dimensione del buffer in RAM
+        bottom.addSpacing(12)
+        bottom.addWidget(QtWidgets.QLabel("Buffer RAM:"))
+        bottom.addWidget(self.spinRam)
         bottom.addStretch(1)
         bottom.addWidget(self.btnStart)
         bottom.addWidget(self.btnStop)
@@ -635,6 +652,13 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # invia i nomi canale al core (per ogni riga della tabella)
         # send channel labels and configure base filename for TDMS segments
         self._push_channel_labels_to_core()
+        # imposta il limite di memoria in base al valore selezionato nella spinbox
+        try:
+            mem_mb = self.spinRam.value()
+            if hasattr(self.acq, "set_memory_limit_mb"):
+                self.acq.set_memory_limit_mb(mem_mb)
+        except Exception:
+            pass
         # reset any residual in‑memory blocks before changing the output directory
         try:
             if hasattr(self.acq, "clear_memory_buffer"):
@@ -729,6 +753,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             dlg.setWindowTitle("Unione in corso")
             dlg.setWindowModality(QtCore.Qt.WindowModal)
             dlg.setValue(0)
+            # memorizza la cartella temporanea perché _active_subdir verrà azzerata
+            tmp_subdir = self._active_subdir
             # Define progress callback
             def _merge_progress(curr: int, total: int):
                 try:
@@ -740,9 +766,15 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
             # Perform merge with progress callback
-            merger.merge_temp_tdms(self._active_subdir, final_path, progress_cb=_merge_progress)
+            merger.merge_temp_tdms(tmp_subdir, final_path, progress_cb=_merge_progress)
             dlg.close()
             QtWidgets.QMessageBox.information(self, "Completato", f"TDMS finale creato:\n{final_path}")
+            # Una volta uniti i segmenti, elimina la cartella temporanea
+            try:
+                if tmp_subdir and os.path.isdir(tmp_subdir):
+                    shutil.rmtree(tmp_subdir, ignore_errors=True)
+            except Exception:
+                pass
         except Exception as e:
             try:
                 dlg.close()

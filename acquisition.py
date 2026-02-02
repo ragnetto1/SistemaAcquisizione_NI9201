@@ -140,6 +140,37 @@ class AcquisitionManager:
         """
         return (self._memory_bytes, self._memory_limit_bytes)
 
+    def set_memory_limit_bytes(self, value: int) -> None:
+        """
+        Set the maximum allowed memory (in bytes) for accumulating blocks in RAM.
+        This value controls when the writer will flush the in-memory buffer to
+        disk. It must be a positive integer.
+
+        Args:
+            value: The desired memory limit in bytes. Values less than or
+                equal to zero are ignored.
+        """
+        try:
+            v = int(value)
+        except Exception:
+            return
+        if v > 0:
+            self._memory_limit_bytes = v
+
+    def set_memory_limit_mb(self, value_mb: float) -> None:
+        """
+        Convenience method to set the memory limit in megabytes.
+
+        Args:
+            value_mb: The desired memory limit in megabytes (MB). Must be >0.
+        """
+        try:
+            mb_val = float(value_mb)
+        except Exception:
+            return
+        if mb_val > 0:
+            self._memory_limit_bytes = int(mb_val * 1024 * 1024)
+
     def clear_memory_buffer(self) -> None:
         """
         Clears any accumulated blocks and resets the memory usage counter.
@@ -602,14 +633,21 @@ class AcquisitionManager:
             Writes all accumulated blocks to a new TDMS file and clears the
             in‑memory buffer. Blocks are sorted by their global start index
             to maintain chronological order. Each block is written as a
-            mini‑segment with appropriate metadata.
+            mini‑segment with appropriate metadata. If the output directory
+            has been removed (e.g. after merging) or is unset, no file is
+            written and the accumulated blocks are simply discarded.
             """
-            # Capture reference for local scope
             nonlocal fs
             # Nothing to flush
             if not self._memory_blocks:
                 return
             try:
+                # If temp_dir is not set or no longer exists, discard accumulated data
+                if not self.temp_dir or not os.path.isdir(self.temp_dir):
+                    # Clear memory without writing
+                    self._memory_blocks.clear()
+                    self._memory_bytes = 0
+                    return
                 # Sort blocks by global start index
                 blocks_sorted = sorted(self._memory_blocks, key=lambda x: x[0])
                 seg_start_idx = blocks_sorted[0][0]
@@ -621,6 +659,11 @@ class AcquisitionManager:
                 base = self._base_filename_no_ext or "segment"
                 fname = f"{base}_{self._file_counter:05d}.tdms"
                 out_path = os.path.join(self.temp_dir, fname)
+                # Ensure the output directory exists
+                try:
+                    os.makedirs(self.temp_dir, exist_ok=True)
+                except Exception:
+                    pass
                 # Open writer
                 with TdmsWriter(open(out_path, "wb")) as writer:
                     # Write each block as a mini‑segment
