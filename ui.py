@@ -95,15 +95,27 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         main = QtWidgets.QVBoxLayout(central)
 
-        # Riga superiore: rileva + device + definisci risorse
+        # Riga superiore: rileva + device + frequenza campionamento + definisci risorse
         top = QtWidgets.QHBoxLayout()
+        # Pulsante per rilevare le schede NI presenti
         self.btnRefresh = QtWidgets.QPushButton("Rileva schede")
-        self.cmbDevice = QtWidgets.QComboBox()
-        self.btnDefineTypes = QtWidgets.QPushButton("Definisci Tipo Risorsa")
         top.addWidget(self.btnRefresh)
+        # Etichetta e combobox per il dispositivo NI
         top.addWidget(QtWidgets.QLabel("Dispositivo:"))
+        self.cmbDevice = QtWidgets.QComboBox()
         top.addWidget(self.cmbDevice, 1)
+        # Campo di input per la frequenza di campionamento per canale
+        top.addWidget(QtWidgets.QLabel("Fs [Hz]:"))
+        self.rateEdit = QtWidgets.QLineEdit()
+        # Imposta dimensione fissa per il campo del rate
+        self.rateEdit.setFixedWidth(80)
+        # Se non impostato, mostra "Max" come suggerimento
+        self.rateEdit.setPlaceholderText("Max")
+        top.addWidget(self.rateEdit)
+        # Pulsante per definire i sensori/risorse
+        self.btnDefineTypes = QtWidgets.QPushButton("Definisci Tipo Risorsa")
         top.addWidget(self.btnDefineTypes)
+        # Allineamento a destra per riempire lo spazio residuo
         main.addLayout(top)
 
         # Tabs
@@ -132,6 +144,17 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._chart_legend.setParentItem(self.pgChart.getPlotItem().graphicsItem())
         self._chart_legend.anchor((0, 1), (0, 1), offset=(10, -10))
         vchart.addWidget(self.pgChart, 1)
+        # Etichetta per mostrare il valore medio di ciascun canale attivo
+        self.lblAvgChart = QtWidgets.QLabel("")
+        # Riduce leggermente la dimensione del carattere per la stringa di media
+        try:
+            fnt_avg = self.lblAvgChart.font()
+            fnt_avg.setPointSize(max(8, fnt_avg.pointSize() - 1))
+            self.lblAvgChart.setFont(fnt_avg)
+        except Exception:
+            pass
+        self.lblAvgChart.setWordWrap(True)
+        vchart.addWidget(self.lblAvgChart)
         hctrl = QtWidgets.QHBoxLayout()
         self.btnClearChart = QtWidgets.QPushButton("Pulizia grafico")
         hctrl.addStretch(1)
@@ -222,6 +245,12 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.table.itemChanged.connect(self._on_table_item_changed)
 
         self.cmbDevice.currentIndexChanged.connect(self._on_device_changed)
+
+        # Aggiorna la frequenza di campionamento quando l'utente conferma il valore
+        try:
+            self.rateEdit.editingFinished.connect(self._on_rate_edit_finished)
+        except Exception:
+            pass
 
         # callback dal core (rimappati in segnali Qt)
         self.channelValueUpdated.connect(self._update_table_value)
@@ -609,6 +638,84 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             self.lblRateInfo.setText("—")
 
+    def _on_rate_edit_finished(self):
+        """
+        Slot invoked when the user finishes editing the sample rate field (Fs [Hz]).
+        Validates the input, applies the user-defined sampling rate to the
+        acquisition manager, and restarts the acquisition if it is currently
+        running. The special value "Max" (case-insensitive) or an empty field
+        reverts to the automatic maximum rate.
+        """
+        # Read and normalize the text
+        txt = (self.rateEdit.text() or "").strip()
+        # Determine if the user wants the maximum rate
+        use_max = False
+        if txt == "" or txt.lower() == "max":
+            use_max = True
+        # Try to parse a numeric rate
+        user_rate: Optional[float] = None
+        if not use_max:
+            try:
+                val = float(txt)
+                if val > 0:
+                    user_rate = val
+                else:
+                    use_max = True
+            except Exception:
+                use_max = True
+        # Apply the rate to the acquisition manager
+        try:
+            if use_max:
+                # Use automatic maximum: reset text to "Max"
+                self.rateEdit.setText("Max")
+                self.acq.set_user_rate_hz(None)
+            else:
+                # Set the user-defined rate
+                self.acq.set_user_rate_hz(user_rate)
+        except Exception:
+            pass
+        # If the acquisition is active (Stop button enabled), restart with new rate
+        if self.btnStop.isEnabled():
+            try:
+                # Get current enabled channels and labels
+                phys, labels = self._enabled_phys_and_labels()
+                if phys:
+                    # Identify the selected device
+                    device = (self.cmbDevice.currentData() or self.cmbDevice.currentText()).strip()
+                    # Stop the current acquisition
+                    try:
+                        self.acq.stop()
+                    except Exception:
+                        pass
+                    # Restart with the same channels and labels
+                    ok = False
+                    try:
+                        ok = self.acq.start(device_name=device, ai_channels=phys, channel_names=labels)
+                    except Exception:
+                        ok = False
+                    if ok:
+                        # Update state variables as in _update_acquisition_from_table()
+                        self._current_phys_order = phys[:]
+                        self._start_label_by_phys = dict(zip(phys, labels))
+                        self._last_enabled_phys = phys[:]
+                        # Recreate curves with distinct colours
+                        self._reset_plots_curves()
+                        # Mark stop button as enabled and start GUI timer if needed
+                        self.btnStop.setEnabled(True)
+                        if not self.guiTimer.isActive():
+                            self.guiTimer.start()
+                        # Update the rate label and push the sensor map to core
+                        try:
+                            self._update_rate_label(phys)
+                        except Exception:
+                            pass
+                        try:
+                            self._push_sensor_map_to_core()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
     def _stop_acquisition_ui_only(self):
         try:
             if self.acq.recording_enabled:
@@ -805,6 +912,13 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._chart_legend.clear()
         self._instant_legend.clear()
 
+        # Cancella la stringa delle medie quando si resettano i grafici
+        try:
+            if hasattr(self, 'lblAvgChart'):
+                self.lblAvgChart.setText("")
+        except Exception:
+            pass
+
     def _reset_plots_curves(self):
         self._reset_plots()
         # Assign distinct colors to each channel for better readability
@@ -911,6 +1025,30 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 y = self._instant_y_by_phys.get(phys)
                 if isinstance(y, np.ndarray) and y.size == self._instant_t.size and y.size > 1:
                     curve.setData(self._instant_t, y)
+
+        # Calcola il valore medio per ogni canale attivo e aggiorna l'etichetta
+        try:
+            if hasattr(self, 'lblAvgChart'):
+                avg_strings = []
+                # Usa l'ordine dei canali avviati per mantenere la coerenza
+                for phys in self._current_phys_order:
+                    dq = self._chart_y_by_phys.get(phys)
+                    if dq and len(dq) > 0:
+                        try:
+                            # Converte il deque in array per calcolare la media
+                            y_vals = np.fromiter(dq, dtype=float, count=len(dq))
+                            if y_vals.size > 0:
+                                avg_val = float(np.mean(y_vals))
+                                # Determina il nome da visualizzare (label al momento dello start) o fallback
+                                label = self._start_label_by_phys.get(phys, self._label_by_phys.get(phys, phys))
+                                unit = self._calib_by_phys.get(phys, {}).get('unit', '')
+                                avg_strings.append(f"{label}: {avg_val:.6g}" + (f" {unit}" if unit else ""))
+                        except Exception:
+                            pass
+                # Aggiorna il testo dell'etichetta con le medie separate da virgola
+                self.lblAvgChart.setText(", ".join(avg_strings) if avg_strings else "")
+        except Exception:
+            pass
 
     # ----------------------------- Definisci Tipo Risorsa -----------------------------
     def _open_resource_manager(self):

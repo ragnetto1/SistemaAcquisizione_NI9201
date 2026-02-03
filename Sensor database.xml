@@ -1,0 +1,2 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Sensors><Sensor><NomeRisorsa>LVDT_50mm</NomeRisorsa><GrandezzaFisica>mm</GrandezzaFisica><CalibrationPoints><Point volt="0.529125072" value="0" /><Point volt="5.5" value="50" /></CalibrationPoints></Sensor></Sensors>

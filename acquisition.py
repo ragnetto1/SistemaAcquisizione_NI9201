@@ -68,6 +68,11 @@ class AcquisitionManager:
         self._channel_names: List[str] = []
 
         self._last_raw: Dict[str, Optional[float]] = {f"ai{i}": None for i in range(8)}
+
+        # User-defined per-channel sampling rate (Hz). When set to a positive value,
+        # it overrides the automatic maximum rate computed from the device and
+        # number of channels. If None, the automatic maximum is used.
+        self._user_rate_hz: Optional[float] = None
         self._sensor_map_by_phys: Dict[str, Dict[str, Any]] = {}
 
         # Registrazione TDMS
@@ -187,6 +192,32 @@ class AcquisitionManager:
             self._memory_blocks = []
         # Reset the byte counter
         self._memory_bytes = 0
+
+    # -------------------- User sample rate API --------------------
+    def set_user_rate_hz(self, rate: Optional[float]) -> None:
+        """
+        Set a user-defined per-channel sampling rate (in Hz). When a positive
+        number is provided, the acquisition will use the smaller between this
+        rate and the maximum hardware rate per channel. If `rate` is None or
+        not a positive number, the automatic maximum rate will be used.
+
+        Parameters
+        ----------
+        rate : float or None
+            Desired per-channel sampling rate in samples per second. Use
+            `None` or any non-positive value to revert to automatic maximum.
+        """
+        if rate is None:
+            self._user_rate_hz = None
+            return
+        try:
+            r = float(rate)
+            if r > 0:
+                self._user_rate_hz = r
+            else:
+                self._user_rate_hz = None
+        except Exception:
+            self._user_rate_hz = None
 
     def zero_channel(self, chan_name: str):
         self._zero[chan_name] = None  # al prossimo giro memorizza come zero
@@ -320,8 +351,18 @@ class AcquisitionManager:
         self._start_channel_names = channel_names[:]
 
         try:
-            # --- rate per-canale (rispetta i limiti del 9201) ---
-            per_chan = self._compute_per_channel_rate(device_name, len(self._ai_channels))
+            # --- rate per-canale (rispetta i limiti del dispositivo e canali) ---
+            # Determine the maximum rate per channel for the given device and channel count
+            per_chan_max = self._compute_per_channel_rate(device_name, len(self._ai_channels))
+            # Use a user-defined rate if provided and positive, clamped to the maximum
+            per_chan = per_chan_max
+            try:
+                if self._user_rate_hz is not None:
+                    r = float(self._user_rate_hz)
+                    if r > 0:
+                        per_chan = min(per_chan_max, r)
+            except Exception:
+                pass
             self.current_rate_hz = per_chan
             self.current_agg_rate_hz = per_chan * max(1, len(self._ai_channels))
 
