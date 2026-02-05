@@ -21,6 +21,9 @@ XML_V2  = "Valore2"
 XML_CAL = "CalibrationPoints"
 XML_POINT = "Point"   # attr: volt, value
 
+# New tag to specify which DAQ devices a sensor supports.
+XML_SUPPORTED_DAQ = "supportedDAQ"
+
 
 # -------- utility di base --------
 def _ensure_db_exists(xml_path: str):
@@ -90,14 +93,25 @@ class ResourceManagerDialog(QtWidgets.QDialog):
         form = QtWidgets.QGridLayout()
         form.setVerticalSpacing(6)
         r = 0
+        # Nome risorsa
         self.cmbName = QtWidgets.QComboBox()
         self.cmbName.setEditable(True)
         form.addWidget(QtWidgets.QLabel("Nome risorsa"), r, 0)
-        form.addWidget(self.cmbName, r, 1, 1, 3); r += 1
+        form.addWidget(self.cmbName, r, 1, 1, 3)
+        r += 1
 
+        # Supported DAQ / schede compatibili
+        # Campo che permette di indicare quali modelli di scheda DAQ sono supportati dal sensore.
+        self.txtSupportedDAQ = QtWidgets.QLineEdit()
+        form.addWidget(QtWidgets.QLabel("Schede compatibili"), r, 0)
+        form.addWidget(self.txtSupportedDAQ, r, 1, 1, 3)
+        r += 1
+
+        # Grandezza fisica (unità)
         self.txtUnit = QtWidgets.QLineEdit()
         form.addWidget(QtWidgets.QLabel("Grandezza fisica"), r, 0)
-        form.addWidget(self.txtUnit, r, 1, 1, 3); r += 1
+        form.addWidget(self.txtUnit, r, 1, 1, 3)
+        r += 1
 
         self.cmbChannel = QtWidgets.QComboBox()
         for i in range(8):
@@ -345,6 +359,12 @@ class ResourceManagerDialog(QtWidgets.QDialog):
         self.cmbName.setEditText("New")  # per creare un nuovo sensore
         self.cmbName.blockSignals(False)
         self.txtUnit.setText("")
+        # Imposta il campo supportedDAQ al valore predefinito quando non è selezionato alcun sensore
+        try:
+            # Il valore predefinito include i modelli NI9201 e NI9202 per compatibilità futura
+            self.txtSupportedDAQ.setText("NI9201,NI9202")
+        except Exception:
+            pass
         self._clear_points()
         self._add_point_row()
         self._add_point_row()
@@ -375,6 +395,21 @@ class ResourceManagerDialog(QtWidgets.QDialog):
             return
         # unità
         self.txtUnit.setText(sens.findtext(XML_UNIT, default=""))
+        # supportedDAQ: stringa con la lista dei modelli compatibili
+        try:
+            sup = sens.findtext(XML_SUPPORTED_DAQ, default="").strip()
+            if sup:
+                # Mostra il valore esistente
+                self.txtSupportedDAQ.setText(sup)
+            else:
+                # Se non è definito, imposta il valore predefinito
+                self.txtSupportedDAQ.setText("NI9201,NI9202")
+        except Exception:
+            # In caso di eccezione lascio il default
+            try:
+                self.txtSupportedDAQ.setText("NI9201,NI9202")
+            except Exception:
+                pass
         # carica punti (nuovo schema), altrimenti da vecchio schema
         pts = []
         cal = sens.find(XML_CAL)
@@ -416,6 +451,8 @@ class ResourceManagerDialog(QtWidgets.QDialog):
             name = name.strip()
 
         unit = self.txtUnit.text().strip()
+        # Valore del campo supportedDAQ (stringa separata da virgole)
+        supported_daq_text = self.txtSupportedDAQ.text().strip()
         # raccogli punti validi
         V, X = self._collect_points()
         if V.size < 2:
@@ -446,22 +483,60 @@ class ResourceManagerDialog(QtWidgets.QDialog):
             found = ET.SubElement(root, XML_ITEM)
             ET.SubElement(found, XML_NAME).text = name
 
-        # set campi base
-        eunit = found.find(XML_UNIT)
-        if eunit is None:
-            eunit = ET.SubElement(found, XML_UNIT)
-        eunit.text = unit
-
-        # rimuovi vecchi tag 2-punti se presenti
+        # Rimuovi eventuali vecchi tag di schema 2-punti
         for t in (XML_V1V, XML_V1, XML_V2V, XML_V2):
             old = found.find(t)
             if old is not None:
                 found.remove(old)
 
-        # scrivi i punti (sostituendo eventuali precedenti)
+        # Rimuovi unità e supportedDAQ se già presenti (verranno reinseriti in ordine)
+        try:
+            old_sup = found.find(XML_SUPPORTED_DAQ)
+            if old_sup is not None:
+                found.remove(old_sup)
+        except Exception:
+            pass
+        try:
+            old_unit = found.find(XML_UNIT)
+            if old_unit is not None:
+                found.remove(old_unit)
+        except Exception:
+            pass
+
+        # Crea elementi unit e supportedDAQ con il valore corrente
+        sup_elem = ET.Element(XML_SUPPORTED_DAQ)
+        # Se il campo è vuoto, usa la stringa predefinita con NI9201 e NI9202
+        sup_elem.text = supported_daq_text if supported_daq_text else "NI9201,NI9202"
+        unit_elem = ET.Element(XML_UNIT)
+        unit_elem.text = unit
+
+        # Inserisci i nuovi elementi subito dopo il NomeRisorsa
+        # Trova l'indice del tag NomeRisorsa all'interno di found
+        inserted = False
+        try:
+            children = list(found)
+            idx_name = None
+            for i, child in enumerate(children):
+                if child.tag == XML_NAME:
+                    idx_name = i
+                    break
+            if idx_name is not None:
+                # Inserisci i nuovi elementi in ordine: supportedDAQ poi unit
+                found.insert(idx_name + 1, sup_elem)
+                found.insert(idx_name + 2, unit_elem)
+                inserted = True
+        except Exception:
+            pass
+        if not inserted:
+            # Se NomeRisorsa non è stato trovato, aggiungi alla fine
+            found.append(sup_elem)
+            found.append(unit_elem)
+
+        # Rimuovi eventuali vecchi punti di calibrazione
         cal = found.find(XML_CAL)
         if cal is not None:
             found.remove(cal)
+        # Scrivi i punti (nuovo schema multi-punti)
         cal = ET.SubElement(found, XML_CAL)
         for v, x in zip(V.tolist(), X.tolist()):
             pt = ET.SubElement(cal, XML_POINT)

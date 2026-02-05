@@ -503,15 +503,39 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         p = SENSOR_DB_DEFAULT
         if not os.path.isfile(p):
             return defs
+        # Determine supported DAQ models for this application.
+        # Il programma deve caricare solo i sensori compatibili con NI9201.
+        supported_daqlist = ["NI9201"]
         try:
             tree = ET.parse(p)
             root = tree.getroot()
             for s in root.findall(XML_ITEM):
-                name = (s.findtext(XML_NAME, default="") or "").strip()
+                try:
+                    name = (s.findtext(XML_NAME, default="") or "").strip()
+                except Exception:
+                    continue
                 if not name:
                     continue
-                unit = (s.findtext(XML_UNIT, default="") or "").strip()
-
+                # Read unit and supportedDAQ (if present)
+                try:
+                    unit = (s.findtext(XML_UNIT, default="") or "").strip()
+                except Exception:
+                    unit = ""
+                # Check supportedDAQ
+                try:
+                    supported = (s.findtext("supportedDAQ", default="") or "").strip()
+                    # If a supportedDAQ tag is present, ensure NI9201 appears among the comma-separated values
+                    if supported:
+                        items = [x.strip().upper() for x in supported.split(",") if x.strip()]
+                        # Se NI9201 non è tra gli elementi, salta questo sensore
+                        if all(item != "NI9201" for item in items):
+                            continue
+                    else:
+                        # Se il tag non esiste o è vuoto, non includere il sensore
+                        continue
+                except Exception:
+                    # In caso di errore, non includere il sensore
+                    continue
                 # nuovo schema multi-punti
                 cal = s.find(XML_CAL)
                 if cal is not None:
@@ -529,7 +553,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                         a, b = np.linalg.lstsq(A, np.asarray(X), rcond=None)[0]
                         defs[name] = {"unit": unit, "a": float(a), "b": float(b)}
                         continue
-
                 # compat vecchio schema (2 punti)
                 def _f(tag):
                     try: return float(s.findtext(tag, default="0") or "0")
@@ -548,12 +571,13 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     def _populate_type_column(self):
         """Popola 'Tipo risorsa' con: Voltage + nomi da Sensor DB."""
+        # Read sensor definitions filtered by supported DAQ and use keys as names
         names = []
         try:
-            from gestione_risorse import get_sensor_names
-            names = get_sensor_names(SENSOR_DB_DEFAULT)
+            defs = self._read_sensor_defs()
+            names = sorted(defs.keys())
         except Exception:
-            pass
+            names = []
         for r in range(self.table.rowCount()):
             cmb: QtWidgets.QComboBox = self.table.cellWidget(r, COL_TYPE)
             if not isinstance(cmb, QtWidgets.QComboBox):
