@@ -7,6 +7,10 @@ import numpy as np
 import os
 import xml.etree.ElementTree as ET
 import datetime
+import json
+
+# Path to store persistent configuration. It resides alongside this script.
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
 
 pg.setConfigOptions(useOpenGL=True, antialias=False)
 
@@ -82,12 +86,30 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._count_timer.setInterval(1000)
         self._count_timer.timeout.connect(self._tick_countdown)
 
+        # Timer to monitor disk stall/backlog
+        self._backlog_timer = QtCore.QTimer(self)
+        self._backlog_timer.setInterval(1000)  # check every second
+        self._backlog_timer.timeout.connect(self._check_backlog)
+        # Default update interval for charts; used to restore after stall
+        self._default_gui_interval = 50
+        # Track if we are in stall mode to avoid repeated adjustments
+        self._stall_active = False
+
         # UI
         self._build_ui()
         self._connect_signals()
 
+        # Load persistent configuration (if available)
+        try:
+            self._load_config()
+        except Exception:
+            pass
+
         # inizializzazione
         self.refresh_devices()
+
+        # Start backlog monitoring timer
+        self._backlog_timer.start()
 
     # ----------------------------- Build UI -----------------------------
     def _build_ui(self):
@@ -222,6 +244,139 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         our_font.setPointSize(9)
         self.lblRateInfo.setFont(our_font)
         self.statusBar.addPermanentWidget(self.lblRateInfo)
+
+    # ------------------------- Configuration persistence -------------------------
+    def _load_config(self):
+        """
+        Load persistent settings from a JSON file if it exists. The settings
+        include the last used save directory, base filename, memory buffer
+        size and sampling rate. This method should be called after the UI
+        widgets have been created so that values can be applied.
+        """
+        if not os.path.isfile(CONFIG_FILE):
+            return
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            return
+        # Apply known settings if present
+        try:
+            sd = cfg.get("save_dir")
+            if sd:
+                self._save_dir = sd
+                self.txtSaveDir.setText(sd)
+        except Exception:
+            pass
+        try:
+            bn = cfg.get("base_filename")
+            if bn:
+                self._base_filename = bn
+                self.txtBaseName.setText(bn)
+        except Exception:
+            pass
+        try:
+            ram_mb = int(cfg.get("ram_mb", 0))
+            if ram_mb > 0:
+                self.spinRam.setValue(ram_mb)
+        except Exception:
+            pass
+        try:
+            fs = cfg.get("fs")
+            if fs:
+                # Show the saved sampling rate in the rateEdit field
+                self.rateEdit.setText(str(fs))
+        except Exception:
+            pass
+
+    def _save_config(self):
+        """
+        Save current UI settings to a JSON configuration file. Only basic
+        values (save directory, base filename, buffer size and sample rate)
+        are persisted. This method is called automatically on application
+        close.
+        """
+        cfg = {}
+        try:
+            cfg["save_dir"] = self.txtSaveDir.text().strip()
+        except Exception:
+            pass
+        try:
+            cfg["base_filename"] = self.txtBaseName.text().strip()
+        except Exception:
+            pass
+        try:
+            cfg["ram_mb"] = int(self.spinRam.value())
+        except Exception:
+            pass
+        try:
+            txt = self.rateEdit.text().strip()
+            if txt:
+                cfg["fs"] = float(txt)
+        except Exception:
+            pass
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        """
+        Reimplement the close event to persist settings before the
+        application terminates.
+        """
+        try:
+            self._save_config()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    # -------------------------- Backlog/Disk stall check --------------------------
+    def _check_backlog(self):
+        """
+        Periodically monitor the estimated disk write backlog. If the backlog
+        exceeds a predefined threshold, a warning is shown in the status bar
+        and the chart refresh interval is reduced to minimize CPU overhead.
+        When the backlog drops below the threshold, the refresh interval is
+        restored and the warning message cleared.
+        """
+        try:
+            # Only monitor when recording is active
+            if not self.acq.recording_enabled:
+                # When not recording, ensure GUI timer uses default interval and clear warning
+                if self._stall_active:
+                    self.guiTimer.setInterval(self._default_gui_interval)
+                    self.statusBar.showMessage("")
+                    self._stall_active = False
+                return
+            backlog_mb = 0.0
+            try:
+                backlog_mb = float(self.acq.get_backlog_estimate())
+            except Exception:
+                backlog_mb = 0.0
+            # Threshold for disk stall warning (MB)
+            threshold_mb = 200.0
+            if backlog_mb >= threshold_mb and not self._stall_active:
+                # Enter stall mode: slow down UI updates and display warning
+                self._stall_active = True
+                # Reduce chart refresh frequency to ease CPU and I/O pressure
+                try:
+                    self.guiTimer.setInterval(max(self._default_gui_interval, 200))
+                except Exception:
+                    pass
+                msg = f"DISK STALL: backlog {backlog_mb:.0f} MB. Rallento l'aggiornamento grafici per evitare perdite."
+                self.statusBar.showMessage(msg)
+            elif backlog_mb < threshold_mb and self._stall_active:
+                # Exit stall mode
+                self._stall_active = False
+                try:
+                    self.guiTimer.setInterval(self._default_gui_interval)
+                except Exception:
+                    pass
+                self.statusBar.showMessage("")
+        except Exception:
+            pass
 
     def _connect_signals(self):
         # pulsanti

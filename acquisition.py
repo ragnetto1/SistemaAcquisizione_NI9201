@@ -103,6 +103,11 @@ class AcquisitionManager:
         self._t0_epoch_s: Optional[float] = None  # tempo assoluto del campione #0
         self._global_samples: int = 0             # contatore globale campioni per canale
 
+        # Size in bytes of a single block of samples pushed to the writer queue. This
+        # value is computed when the acquisition task starts. It is used to
+        # estimate the backlog queued for disk in get_backlog_estimate().
+        self._block_bytes: int = 0
+
     # -------------------- API verso la UI --------------------
     def set_output_directory(self, path: str):
         if not path:
@@ -144,6 +149,32 @@ class AcquisitionManager:
         this information to display progress.
         """
         return (self._memory_bytes, self._memory_limit_bytes)
+
+    def get_backlog_estimate(self) -> float:
+        """
+        Estimate the size of pending samples waiting to be written to disk.
+
+        This method computes an approximate backlog based on the current
+        writer queue size and the size of a single block. It returns the
+        estimated backlog in megabytes (MB). If the block size is unknown or
+        the queue size cannot be determined, it returns 0.0.
+
+        Returns
+        -------
+        float
+            Estimated backlog in megabytes.
+        """
+        try:
+            q = self._queue
+            block_bytes = int(self._block_bytes or 0)
+            # The queue may be unbounded; qsize gives an estimate of items
+            queued_blocks = int(getattr(q, "qsize", lambda: 0)())
+            backlog_bytes = queued_blocks * block_bytes
+            # Include any in‑memory buffer that has not yet been flushed
+            backlog_bytes += int(self._memory_bytes or 0)
+            return backlog_bytes / float(1024 * 1024)
+        except Exception:
+            return 0.0
 
     def set_memory_limit_bytes(self, value: int) -> None:
         """
@@ -378,7 +409,17 @@ class AcquisitionManager:
 
             # --- QUEUE dimensionata (max ~30 s o 256 MB) ---
             nch = max(1, len(self._ai_channels))
+            # Determine how many bytes each block occupies. Each block has shape
+            # (n_channels, callback_chunk) and is stored as float64 values (8 bytes per sample).
             bytes_per_block = nch * self.callback_chunk * 8  # float64
+
+            # Persist the block size for backlog monitoring. This value will be
+            # used by get_backlog_estimate() to estimate the amount of data
+            # currently waiting to be flushed to disk.
+            try:
+                self._block_bytes = int(bytes_per_block)
+            except Exception:
+                self._block_bytes = 0
             queue_target_seconds = 30
             blocks_target = max(50, int(per_chan * queue_target_seconds / self.callback_chunk))
             MEMORY_BUDGET_MB = 256
@@ -705,12 +746,49 @@ class AcquisitionManager:
                     os.makedirs(self.temp_dir, exist_ok=True)
                 except Exception:
                     pass
-                # Open writer
-                with TdmsWriter(open(out_path, "wb")) as writer:
-                    # Write each block as a mini‑segment
+                # Write to a temporary file first to ensure atomicity. Only once
+                # the file has been completely written do we rename it to the
+                # final filename. This avoids leaving behind a partially written
+                # TDMS file in case of interruption.
+                tmp_path = out_path + ".tmp"
+                # Ensure no stale tmp file remains
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                with TdmsWriter(open(tmp_path, "wb")) as writer:
+                    # Precompute the sanitized TDMS names once per flush
+                    try:
+                        tdms_names = list(self._current_tdms_names())
+                    except Exception:
+                        tdms_names = list(self._ai_channels)
+                    # Extend names if there are more channels than names
+                    try:
+                        if len(tdms_names) < blocks_sorted[0][1].shape[0]:
+                            used = set(["Time"]) | set(tdms_names)
+                            for i in range(len(tdms_names), blocks_sorted[0][1].shape[0]):
+                                base_nm = self._sanitize_tdms_basename(
+                                    self._ai_channels[i] if i < len(self._ai_channels) else f"ai{i}"
+                                )
+                                name = base_nm
+                                k = 2
+                                while name in used:
+                                    name = f"{base_nm}_{k}"
+                                    k += 1
+                                tdms_names.append(name)
+                                used.add(name)
+                    except Exception:
+                        pass
+                    # Precompute ISO timestamp for the segment
+                    seg_iso = datetime.datetime.fromtimestamp(start_time_epoch_s).isoformat()
+                    # Loop through blocks and write them
                     for (blk_start_idx, buf) in blocks_sorted:
                         # Compute starting offset within this file
-                        start_in_file = int(blk_start_idx - seg_start_idx)
+                        try:
+                            start_in_file = int(blk_start_idx - seg_start_idx)
+                        except Exception:
+                            start_in_file = 0
                         # Validate block shape
                         try:
                             n = int(buf.shape[1])
@@ -718,34 +796,12 @@ class AcquisitionManager:
                             continue
                         if n <= 0:
                             continue
-                        # Build list of TDMS channel names (sanitized and deduplicated)
-                        try:
-                            tdms_names = list(self._current_tdms_names())
-                        except Exception:
-                            tdms_names = list(self._ai_channels)
-                        # Extend names if there are more channels than names
-                        try:
-                            if len(tdms_names) < buf.shape[0]:
-                                used = set(["Time"]) | set(tdms_names)
-                                for i in range(len(tdms_names), buf.shape[0]):
-                                    base_nm = self._sanitize_tdms_basename(
-                                        self._ai_channels[i] if i < len(self._ai_channels) else f"ai{i}"
-                                    )
-                                    name = base_nm
-                                    k = 2
-                                    while name in used:
-                                        name = f"{base_nm}_{k}"
-                                        k += 1
-                                    tdms_names.append(name)
-                                    used.add(name)
-                        except Exception:
-                            pass
                         # Compute relative time vector for this mini‑segment
                         try:
                             t_rel = (start_in_file / fs) + (np.arange(n, dtype=np.float64) / fs)
                         except Exception:
                             continue
-                        # Root and group objects
+                        # Root and group objects with wf_* properties
                         try:
                             root = RootObject(properties={
                                 "sample_rate": fs,
@@ -753,6 +809,10 @@ class AcquisitionManager:
                                 "start_index": int(seg_start_idx),
                                 "chunk_offset": int(start_in_file),
                                 "start_time_epoch_s": float(start_time_epoch_s),
+                                "segment_start_time_iso": seg_iso,
+                                # Provide waveform metadata at root level as well
+                                "wf_start_time": datetime.datetime.fromtimestamp(start_time_epoch_s),
+                                "wf_increment": 1.0 / fs,
                             })
                             group = GroupObject("Acquisition")
                         except Exception:
@@ -820,6 +880,17 @@ class AcquisitionManager:
                 # Clear memory after writing
                 self._memory_blocks.clear()
                 self._memory_bytes = 0
+                # Atomically rename the temporary file to its final name
+                try:
+                    os.replace(tmp_path, out_path)
+                except Exception as e:
+                    # If rename fails, attempt to clean up and report
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    print("Writer error (atomic rename):", e)
             except Exception as e:
                 print("Writer flush error:", e)
 

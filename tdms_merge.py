@@ -63,6 +63,29 @@ class TdmsMerger:
 
     # -------------------- API --------------------
     def merge_temp_tdms(self, folder: str, out_path: str, progress_cb: Optional[Callable[[int, int], None]] = None):
+        """
+        Merge all TDMS segments in ``folder`` into a single TDMS file at
+        ``out_path``.
+
+        This implementation streams each source segment into the final file
+        sequentially to avoid loading all data into memory at once. It also
+        performs a post‑merge validation of the resulting file to ensure
+        temporal consistency. If validation fails, no temporary data is
+        removed and a ``RuntimeError`` is raised.
+
+        Parameters
+        ----------
+        folder : str
+            Directory containing the temporary TDMS segments to merge.
+        out_path : str
+            Destination path for the merged TDMS file. A temporary file with
+            extension ``.tmp`` is written first and renamed atomically on
+            success.
+        progress_cb : callable, optional
+            Callback function receiving two integers ``(current, total)`` to
+            report merge progress. Called after each source segment is
+            processed.
+        """
         if not os.path.isdir(folder):
             raise RuntimeError(f"Cartella segmenti non trovata: {folder}")
 
@@ -70,45 +93,34 @@ class TdmsMerger:
         if not segs:
             raise RuntimeError("Nessun segmento TDMS trovato da unire.")
 
-        # Cache strutture
-        ch_names = None                 # elenco dei canali DATI (esclude 'Time')
-        props_cache = {}                # properties per canale (dal primo segmento utile)
-        data_by_name = {}               # lista di pezzi per canale
-        time_pieces = []                # pezzi del canale Time (se ricostruito da wf_*)
-        cumulative_samples = 0          # per costruire il Time se serve
-
-        t0_first = None                 # datetime inizio prova
-        fs = None                       # frequenza di campionamento (1 / wf_increment)
-
-        # --------------- Scansione segmenti ---------------
         total_segs = len(segs)
-        curr_seg = 0
+
+        # First pass: gather metadata and channel names without loading all data
+        ch_names = None
+        props_cache = {}
+        t0_first = None
+        fs = None
+        seg_times_iso = []
+
         for path in segs:
-            curr_seg += 1
             try:
                 td = TdmsFile.read(path)
             except Exception:
                 continue
-
             grp = self._pick_group(td)
             if grp is None:
                 continue
-
-            # Elenco canali DATI dal primo segmento (escludo "Time")
+            # Determine channel names (excluding Time) once
             if ch_names is None:
                 try:
                     ch_names = [c.name for c in grp.channels() if c.name != "Time"]
                 except Exception:
                     ch_names = []
                 if not ch_names:
-                    # se proprio non ci sono canali dati, prova a ignorare questo segmento
                     continue
                 for nm in ch_names:
-                    data_by_name[nm] = []
-
-            # Ricava t0_first e fs dal PRIMO canale che li dichiara
-            # (preferibilmente dal Time se presente, altrimenti da un canale dati)
-            # --- 1) prova dal canale Time del segmento ---
+                    props_cache[nm] = {}
+            # Extract t0 and dt from Time channel or a data channel
             seg_t0 = None
             seg_dt = None
             if "Time" in grp:
@@ -118,7 +130,6 @@ class TdmsMerger:
                     seg_dt = p.get("wf_increment", None)
                 except Exception:
                     pass
-            # --- 2) se mancano, prova da un canale dati ---
             if seg_t0 is None or seg_dt in (None, 0):
                 for nm in ch_names:
                     if nm in grp:
@@ -132,8 +143,7 @@ class TdmsMerger:
                             pass
                     if seg_t0 is not None and seg_dt not in (None, 0):
                         break
-
-            # inizializza t0_first e fs dal primo segmento utile
+            # Record global t0 and fs on first appearance
             if t0_first is None and seg_t0 is not None:
                 t0_first = _to_py_datetime(seg_t0) or datetime.datetime.now()
             if fs is None and seg_dt not in (None, 0):
@@ -141,108 +151,208 @@ class TdmsMerger:
                     fs = 1.0 / float(seg_dt)
                 except Exception:
                     pass
-
-            # Determina N campioni del segmento:
-            # preferisci len(Time), altrimenti prendi len del primo canale dati presente
-            N = None
-            if "Time" in grp:
-                try:
-                    N = len(grp["Time"])
-                except Exception:
-                    N = None
-            if N is None:
-                for nm in ch_names:
-                    if nm in grp:
-                        try:
-                            N = len(grp[nm])
-                            break
-                        except Exception:
-                            pass
-            if N is None or N <= 0:
-                continue
-
-            # Accumula i dati per canale
-            for nm in ch_names:
-                try:
-                    if nm in grp:
-                        arr = grp[nm][:]
-                        if arr.size > 0:
-                            data_by_name[nm].append(arr)
-                except Exception:
-                    pass
-
-            # Ricostruzione del Time assoluto:
-            # Se abbiamo già t0_first e fs, calc Time del segmento come offset cumulativo
-            if t0_first is not None and fs not in (None, 0):
-                dt = 1.0 / float(fs)
-                t_seg = (cumulative_samples / float(fs)) + np.arange(N, dtype=np.float64) * dt
-                time_pieces.append(t_seg)
-            cumulative_samples += (N or 0)
-
-            # Cache delle properties per ogni canale (solo la prima volta che lo si vede)
-            for nm in ch_names:
+            # Capture per‑segment start time in ISO format for metadata
+            try:
+                if seg_t0 is not None:
+                    iso = (_to_py_datetime(seg_t0) or datetime.datetime.now()).isoformat()
+                else:
+                    iso = datetime.datetime.now().isoformat()
+                seg_times_iso.append(iso)
+            except Exception:
+                seg_times_iso.append(datetime.datetime.now().isoformat())
+            # Cache channel properties from first available segment for each channel
+            for nm in ch_names or []:
                 if nm not in props_cache and nm in grp:
                     try:
                         props_cache[nm] = dict(grp[nm].properties)
                     except Exception:
                         props_cache[nm] = {}
 
-            # progress update callback
-            if progress_cb:
-                try:
-                    progress_cb(curr_seg, total_segs)
-                except Exception:
-                    pass
-        # --------------- Validazioni e fallback ---------------
         if ch_names is None:
             raise RuntimeError("Nessun canale valido trovato nei segmenti.")
         if t0_first is None:
             t0_first = datetime.datetime.now()
         if fs is None or fs <= 0:
-            fs = 1.0  # fallback prudente
+            fs = 1.0
 
-        # --------------- Concatena dati ---------------
-        for nm in ch_names:
-            if data_by_name[nm]:
-                data_by_name[nm] = np.concatenate(data_by_name[nm], axis=0)
-            else:
-                data_by_name[nm] = np.array([], dtype=np.float64)
-
-        # --------------- Costruisci il canale Time continuo ---------------
-        if time_pieces:
-            time_total = np.concatenate(time_pieces, axis=0)
-        else:
-            # fallback: genera Time da 0 a N-1 / fs
-            n = len(next(iter(data_by_name.values()))) if data_by_name else 0
-            time_total = np.arange(n, dtype=np.float64) / float(fs)
-
-        # --------------- Scrittura finale ---------------
+        # Second pass: write data to temporary output file streaming segment by segment
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-        with TdmsWriter(open(out_path, "wb")) as w:
-            root = RootObject(properties={
-                "created": datetime.datetime.now(),
-                "wf_merged": True,
-                "source_folder": os.path.abspath(folder),
-            })
-            group = GroupObject("Acquisition")
-            channels = []
+        tmp_out = out_path + ".tmp"
+        # Remove any existing tmp file
+        try:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        except Exception:
+            pass
 
-            # Canale Time CONTINUO (secondi dall'inizio prova)
-            channels.append(
-                ChannelObject("Acquisition", "Time", time_total, properties={
-                    "unit_string": "s",
-                    "wf_start_time": t0_first,                 # inizio della prova
-                    "wf_increment": 1.0 / float(fs),          # passo temporale
-                    "stored_domain": "time",
-                })
+        cumulative_samples = 0
+        # Precompute a joined string of all segment start times for metadata
+        seg_times_str = ";".join(seg_times_iso)
+        # Current segment index
+        seg_index = 0
+
+        with TdmsWriter(open(tmp_out, "wb")) as w:
+            for path in segs:
+                seg_index += 1
+                try:
+                    td = TdmsFile.read(path)
+                except Exception:
+                    continue
+                grp = self._pick_group(td)
+                if grp is None:
+                    continue
+                # Determine N samples for this segment
+                N = None
+                if "Time" in grp:
+                    try:
+                        N = len(grp["Time"])
+                    except Exception:
+                        N = None
+                if N is None:
+                    for nm in ch_names:
+                        if nm in grp:
+                            try:
+                                N = len(grp[nm])
+                                break
+                            except Exception:
+                                pass
+                if N is None or N <= 0:
+                    if progress_cb:
+                        try:
+                            progress_cb(seg_index, total_segs)
+                        except Exception:
+                            pass
+                    continue
+                # Compute time vector for this segment in seconds from start of test
+                dt = 1.0 / float(fs)
+                t_rel = (cumulative_samples / float(fs)) + np.arange(N, dtype=np.float64) * dt
+                cumulative_samples += N
+                # Build root and group objects with metadata
+                try:
+                    root = RootObject(properties={
+                        "created": datetime.datetime.now(),
+                        "wf_merged": True,
+                        "source_folder": os.path.abspath(folder),
+                        "segment_index": seg_index,
+                        "segment_start_time_iso": seg_times_iso[seg_index - 1] if seg_index - 1 < len(seg_times_iso) else "",
+                        "all_segment_start_times": seg_times_str,
+                        # Provide waveform metadata at root level as well
+                        "wf_start_time": t0_first,
+                        "wf_increment": dt,
+                    })
+                    group = GroupObject("Acquisition")
+                except Exception:
+                    if progress_cb:
+                        try:
+                            progress_cb(seg_index, total_segs)
+                        except Exception:
+                            pass
+                    continue
+                # Build Time channel
+                channels = []
+                try:
+                    channels.append(
+                        ChannelObject("Acquisition", "Time", t_rel, properties={
+                            "unit_string": "s",
+                            "wf_start_time": t0_first,
+                            "wf_increment": dt,
+                            "stored_domain": "time",
+                        })
+                    )
+                except Exception:
+                    pass
+                # Build data channels
+                try:
+                    for nm in ch_names:
+                        if nm not in grp:
+                            # Skip channels absent in this segment
+                            continue
+                        try:
+                            arr = grp[nm][:]
+                        except Exception:
+                            continue
+                        # Copy properties, update waveform start time and increment
+                        props = dict(props_cache.get(nm, {}))
+                        props["wf_start_time"] = t0_first
+                        props["wf_increment"] = dt
+                        channels.append(ChannelObject("Acquisition", nm, arr, properties=props))
+                    # Write this segment to the writer
+                    w.write_segment([root, group] + channels)
+                except Exception:
+                    pass
+                # Report progress
+                if progress_cb:
+                    try:
+                        progress_cb(seg_index, total_segs)
+                    except Exception:
+                        pass
+        # Atomically rename the temporary file to its final name
+        try:
+            os.replace(tmp_out, out_path)
+        except Exception as e:
+            # Clean up tmp file on failure
+            try:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+            except Exception:
+                pass
+            raise RuntimeError(f"Errore durante il rename atomico: {e}")
+
+        # Post‑merge validation: open the final file and check consistency
+        if not self._validate_merged_file(out_path, fs):
+            raise RuntimeError(
+                "Merge non valido: i canali hanno lunghezze inconsistenti o il tempo non è monotono. "
+                "I segmenti originali sono stati conservati per permettere il recupero."
             )
 
-            # Canali dati come waveform continue
-            for nm in ch_names:
-                props = dict(props_cache.get(nm, {}))
-                # Aggiorna/forza wf_* per l'intero file unito
-                props["wf_start_time"] = t0_first
-                props["wf_increment"] = 1.0 / float(fs)
-                channels.append(ChannelObject("Acquisition", nm, data_by_name[nm], properties=props))
+    def _validate_merged_file(self, path: str, fs: float) -> bool:
+        """
+        Validate that the merged TDMS file at ``path`` has channels of
+        consistent length and a monotonic, regularly sampled time vector.
 
-            w.write_segment([root, group] + channels)
+        Parameters
+        ----------
+        path : str
+            Path of the merged TDMS file to validate.
+        fs : float
+            Sampling frequency used to compute expected time increments.
+
+        Returns
+        -------
+        bool
+            True if the file passes all checks, False otherwise.
+        """
+        try:
+            td = TdmsFile.read(path)
+            grp = self._pick_group(td)
+            if grp is None:
+                return False
+            # Ensure Time channel exists
+            if "Time" not in grp:
+                return False
+            t = grp["Time"][:]
+            if not isinstance(t, np.ndarray) or t.size == 0:
+                return False
+            # Check monotonic increase
+            dt = np.diff(t)
+            if not np.all(dt > 0):
+                return False
+            # Check approximate constant spacing
+            expected = 1.0 / float(fs)
+            tol = max(1e-6, 0.05 * expected)  # allow 5% variation
+            if not np.all(np.abs(dt - expected) <= tol):
+                return False
+            # Check all data channels have same length as Time
+            n = t.size
+            for ch in grp.channels():
+                if ch.name == "Time":
+                    continue
+                try:
+                    arr = ch[:]
+                except Exception:
+                    return False
+                if len(arr) != n:
+                    return False
+            return True
+        except Exception:
+            return False
