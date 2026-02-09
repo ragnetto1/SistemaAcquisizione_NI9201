@@ -10,6 +10,7 @@ import os
 import xml.etree.ElementTree as ET
 import datetime
 import json
+from typing import List, Callable, Optional, Dict, Any, Tuple
 
 # Path to store persistent configuration. It resides alongside this script.
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
