@@ -14,7 +14,14 @@ import json
 # Path to store persistent configuration. It resides alongside this script.
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
 
-pg.setConfigOptions(useOpenGL=True, antialias=False)
+#
+# Disable OpenGL rendering for pyqtgraph.  Using OpenGL together with
+# PlotCurveItem.setData can lead to a memory leak on some systems.  See
+# https://github.com/pyqtgraph/pyqtgraph/issues/3372 for discussion.  By
+# disabling OpenGL here we force pyqtgraph to use its native Qt painting
+# backend which has much more predictable memory usage.  Antialiasing is
+# also disabled to keep CPU usage modest.
+pg.setConfigOptions(useOpenGL=False, antialias=False)
 
 # Colonne tabella
 COL_ENABLE   = 0
@@ -92,8 +99,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._backlog_timer = QtCore.QTimer(self)
         self._backlog_timer.setInterval(1000)  # check every second
         self._backlog_timer.timeout.connect(self._check_backlog)
-        # Default update interval for charts; used to restore after stall
-        self._default_gui_interval = 50
+        # Default update interval for charts; used to restore after stall.
+        # A longer refresh interval (e.g. 100 ms) reduces CPU usage and memory
+        # churn associated with converting deques to arrays at high rates.  The
+        # memory footprint of charts grows if arrays are reallocated too often.
+        self._default_gui_interval = 100
         # Track if we are in stall mode to avoid repeated adjustments
         self._stall_active = False
 
@@ -241,9 +251,14 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         bottom.addWidget(self.btnStop)
         main.addLayout(bottom)
 
-        # Timer aggiornamento grafici
+        # Timer per l'aggiornamento dei grafici.  Un intervallo più lungo
+        # (100 ms invece dei 50 ms precedenti) riduce il numero di
+        # conversioni da deque a array e di chiamate a setData, riducendo
+        # l'uso di memoria nel lungo periodo.  Questo valore può essere
+        # ulteriormente modificato dinamicamente dalla routine di controllo
+        # dello stall.
         self.guiTimer = QtCore.QTimer(self)
-        self.guiTimer.setInterval(50)
+        self.guiTimer.setInterval(100)
         self.guiTimer.timeout.connect(self._refresh_plots)
 
         # Status bar + etichetta sempre visibile con rate
@@ -743,20 +758,56 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         if col == COL_LABEL:
             # --- Rinominare NON deve toccare l'acquisizione ---
             phys = self.table.item(row, COL_PHYS).text().strip() if self.table.item(row, COL_PHYS) else ""
+            # Etichetta digitata dall'utente (fallback al nome fisico se vuota)
             new_label = (item.text() or "").strip() or phys
 
-            # aggiorna mapping locale e legenda
+            # Deduplica il nuovo nome rispetto agli altri canali.  Se esiste già un
+            # altro canale con la stessa etichetta (ignorando la differenza
+            # maiuscole/minuscole), appende un suffisso _2, _3, ... fino a trovare
+            # un nome non in uso.  Questa logica evita ambiguità quando i nomi
+            # duplicati vengono usati per instradare i dati dal core alla UI.
+            try:
+                base = new_label
+                if base:
+                    # Raccogli tutte le etichette degli altri canali (case-insensitive)
+                    existing = []
+                    for r in range(self.table.rowCount()):
+                        if r == row:
+                            continue
+                        it_lbl = self.table.item(r, COL_LABEL)
+                        if it_lbl:
+                            txt = (it_lbl.text() or "").strip()
+                            if txt:
+                                existing.append(txt.lower())
+                    # Se il nuovo nome è già presente, trova un suffisso libero
+                    if base.lower() in existing:
+                        suffix = 2
+                        candidate = f"{base}_{suffix}"
+                        while candidate.lower() in existing:
+                            suffix += 1
+                            candidate = f"{base}_{suffix}"
+                        # Aggiorna la cella con il nome deduplicato evitando eventi di ricorsione
+                        self._auto_change = True
+                        item.setText(candidate)
+                        self._auto_change = False
+                        new_label = candidate
+            except Exception:
+                # In caso di errore durante la deduplicazione, continua con il nome originale
+                pass
+
+            # Aggiorna il mapping locale e le legende con l'etichetta (deduplicata)
             self._label_by_phys[phys] = new_label
             self._rebuild_legends()
 
-            # invia subito al core (per TDMS)
+            # Invia subito il nome canale deduplicato al core, in modo che i TDMS
+            # utilizzino nomi univoci e coerenti.
             try:
                 self.acq.set_ui_name_for_phys(phys, new_label)
             except Exception:
                 pass
 
             # Opzionale: aggiorna l'etichetta della frequenza se l'acquisizione è attiva.
-            # Utilizziamo il flag interno _running invece dello stato del pulsante Stop,
+            # Usiamo il flag interno _running invece dello stato del pulsante Stop,
             # poiché quest'ultimo viene abilitato solo durante il salvataggio.
             try:
                 if getattr(self.acq, '_running', False):
@@ -828,6 +879,31 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Errore", "Impossibile avviare l'acquisizione.")
             return
 
+        # Ensure that channel names used by the core are unique.  Duplicated labels
+        # can cause the mapping from start names back to physical channels to be
+        # ambiguous.  Use the acquisition manager helper to deduplicate labels.
+        try:
+            # set_channel_labels updates the internal _channel_names list with
+            # unique names.  These names will be used for TDMS channels.  To
+            # ensure that callbacks from the acquisition core provide these
+            # deduplicated names as well, also update _start_channel_names.
+            self.acq.set_channel_labels(labels)
+            # Retrieve the sanitized names; fall back to the original list on error
+            labels = list(self.acq._channel_names)
+            # Update the start_channel_names so that callback events emit the
+            # deduplicated names.  Without this assignment, the acquisition
+            # core would continue to use the original (possibly duplicated)
+            # names for callbacks, leading to ambiguous routing in the UI.
+            try:
+                self.acq._start_channel_names = labels[:]
+            except Exception:
+                pass
+        except Exception:
+            # In case of any error, keep the provided labels
+            pass
+        # Record the current order of physical channels and the labels used at
+        # acquisition start.  These mappings are used to route incoming data
+        # (start names) back to the correct physical channel.
         self._current_phys_order = phys[:]
         self._start_label_by_phys = dict(zip(phys, labels))
         self._last_enabled_phys = phys[:]
