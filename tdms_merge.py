@@ -160,9 +160,23 @@ class TdmsMerger:
                 seg_times_iso.append(iso)
             except Exception:
                 seg_times_iso.append(datetime.datetime.now().isoformat())
-            # Cache channel properties from first available segment for each channel
+            # Cache channel properties from the first available occurrence for each channel.
+            # We initialise props_cache lazily: when ch_names is first set we do not
+            # fill props_cache to avoid blocking subsequent updates.  For each
+            # segment, store the channel's properties only if they have not yet
+            # been captured (props_cache[nm] is empty or missing).  This ensures
+            # that custom properties such as Description, Unit, scale_a,
+            # scale_b, zero_applied, etc., are preserved from the first segment
+            # containing the channel.
             for nm in ch_names or []:
-                if nm not in props_cache and nm in grp:
+                try:
+                    # Determine if we already have properties for this channel
+                    has_props = nm in props_cache and bool(props_cache[nm])
+                except Exception:
+                    has_props = False
+                # If we don't have properties yet and the group contains this channel,
+                # capture its properties now.
+                if not has_props and nm in grp:
                     try:
                         props_cache[nm] = dict(grp[nm].properties)
                     except Exception:

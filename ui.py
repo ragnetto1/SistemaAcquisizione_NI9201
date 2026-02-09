@@ -755,9 +755,14 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-            # opzionale: aggiorna label rate se stai acquisendo
-            if self.btnStop.isEnabled():
-                self._update_rate_label(self._current_phys_order)
+            # Opzionale: aggiorna l'etichetta della frequenza se l'acquisizione è attiva.
+            # Utilizziamo il flag interno _running invece dello stato del pulsante Stop,
+            # poiché quest'ultimo viene abilitato solo durante il salvataggio.
+            try:
+                if getattr(self.acq, '_running', False):
+                    self._update_rate_label(self._current_phys_order)
+            except Exception:
+                pass
             return  # <— importante: NON proseguire
 
         # altri casi che possono richiedere riconfigurazione
@@ -800,13 +805,23 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.lblRateInfo.setText("—")
             return
 
-        if phys == self._last_enabled_phys and self.btnStop.isEnabled():
+        # If the set of enabled channels has not changed and an acquisition is
+        # currently running, simply update the rate label and return.  We no
+        # longer rely on the state of the Stop/Recompose button here because
+        # that button is only enabled when recording is active, not when the
+        # acquisition is running.
+        if phys == self._last_enabled_phys and getattr(self.acq, '_running', False):
             self._update_rate_label(phys)
             return
 
-        # se già attiva, ferma e riavvia con nuova lista
-        if self.btnStop.isEnabled():
-            self.acq.stop()
+        # If an acquisition is already running, stop it before starting a new
+        # one with the updated list of channels.  Use the internal running flag
+        # rather than the Stop/Recompose button state.
+        if getattr(self.acq, '_running', False):
+            try:
+                self.acq.stop()
+            except Exception:
+                pass
 
         ok = self.acq.start(device_name=device, ai_channels=phys, channel_names=labels)
         if not ok:
@@ -819,7 +834,14 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # grafici
         self._reset_plots_curves()
-        self.btnStop.setEnabled(True)
+        # Enable the Stop/Recompose button only when recording is active.  At this
+        # point a new acquisition has just started but recording (salvataggio) has
+        # not yet been enabled via the "Salva dati" button, so leave it disabled.
+        try:
+            self.btnStop.setEnabled(bool(self.acq.recording_enabled))
+        except Exception:
+            # Fallback: disable the button if we cannot read the recording state
+            self.btnStop.setEnabled(False)
         if not self.guiTimer.isActive():
             self.guiTimer.start()
 
@@ -877,8 +899,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 self.acq.set_user_rate_hz(user_rate)
         except Exception:
             pass
-        # If the acquisition is active (Stop button enabled), restart with new rate
-        if self.btnStop.isEnabled():
+        # If an acquisition is currently running, restart it with the new sampling rate.
+        # We use the internal running flag rather than the state of the Stop/Recompose
+        # button because that button is only enabled when recording (salvataggio) is active.
+        if getattr(self.acq, '_running', False):
             try:
                 # Get current enabled channels and labels
                 phys, labels = self._enabled_phys_and_labels()
@@ -903,8 +927,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                         self._last_enabled_phys = phys[:]
                         # Recreate curves with distinct colours
                         self._reset_plots_curves()
-                        # Mark stop button as enabled and start GUI timer if needed
-                        self.btnStop.setEnabled(True)
+                        # Enable the Stop/Recompose button only if we are currently recording.
+                        try:
+                            self.btnStop.setEnabled(bool(self.acq.recording_enabled))
+                        except Exception:
+                            self.btnStop.setEnabled(False)
                         if not self.guiTimer.isActive():
                             self.guiTimer.start()
                         # Update the rate label and push the sensor map to core
@@ -943,8 +970,14 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.txtSaveDir.setText(folder)
 
     def _on_start_saving(self):
-        # deve essere attiva un’acquisizione
-        if not self.btnStop.isEnabled():
+        # Deve essere attiva un'acquisizione per iniziare a salvare.  Usiamo lo
+        # stato interno dell'acquisition manager invece del pulsante Stop, che
+        # viene abilitato solo durante il salvataggio.
+        try:
+            is_running = bool(getattr(self.acq, '_running', False))
+        except Exception:
+            is_running = False
+        if not is_running:
             QtWidgets.QMessageBox.warning(self, "Attenzione", "Abilita almeno un canale per avviare il salvataggio.")
             return
 
@@ -981,6 +1014,13 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.acq.set_base_filename(base_name)
         # enable recording so the writer will start accumulating blocks in RAM
         self.acq.set_recording(True)
+
+        # Now that recording is active, the Stop/Recompose button can be used to
+        # stop and merge the temporary TDMS files.  Enable it explicitly.
+        try:
+            self.btnStop.setEnabled(True)
+        except Exception:
+            pass
 
         self._active_subdir = subdir
         self._save_dir = base_dir
@@ -1053,7 +1093,21 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Info", "Acquisizione fermata. Nessuna cartella di salvataggio attiva.")
             return
 
+        # Determine the desired final TDMS path.  If a file with the same
+        # name already exists in the save directory, append the current date and
+        # time (dd_mm_yy_hh_mm_ss) to avoid overwriting it.
         final_path = os.path.join(self._save_dir, self._base_filename)
+        try:
+            if os.path.exists(final_path):
+                # Split the base filename into name and extension
+                base_name, ext = os.path.splitext(self._base_filename)
+                # Current date/time string
+                dt_str = datetime.datetime.now().strftime("%d_%m_%y_%H_%M_%S")
+                # Compose a new filename with the date/time appended
+                new_name = f"{base_name}_{dt_str}{ext or '.tdms'}"
+                final_path = os.path.join(self._save_dir, new_name)
+        except Exception:
+            pass
         # Merge the temporary TDMS files into the final file with progress feedback
         try:
             from tdms_merge import TdmsMerger

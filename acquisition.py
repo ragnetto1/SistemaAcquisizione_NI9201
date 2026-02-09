@@ -820,13 +820,22 @@ class AcquisitionManager:
                         # Channels: build Time channel
                         channels = []
                         try:
+                            # Include descriptive metadata for the time channel as well.  The
+                            # NI TDMS viewer shows the capitalised "Description" and "Unit"
+                            # fields in the base properties.  Adding them here makes the
+                            # time channel's metadata explicit.  We also keep the lowercase
+                            # variant and waveform parameters for completeness.
+                            time_props = {
+                                "Description": "Time",
+                                "description": "Time",
+                                "Unit": "s",
+                                "unit_string": "s",
+                                "wf_start_time": datetime.datetime.fromtimestamp(start_time_epoch_s),
+                                "wf_increment": 1.0 / fs,
+                                "stored_domain": "time",
+                            }
                             channels.append(ChannelObject(
-                                "Acquisition", "Time", t_rel, properties={
-                                    "unit_string": "s",
-                                    "wf_start_time": datetime.datetime.fromtimestamp(start_time_epoch_s),
-                                    "wf_increment": 1.0 / fs,
-                                    "stored_domain": "time",
-                                }
+                                "Acquisition", "Time", t_rel, properties=time_props
                             ))
                         except Exception:
                             pass
@@ -850,14 +859,19 @@ class AcquisitionManager:
                                     if baseline is not None:
                                         try:
                                             raw = raw - float(baseline)
-                                            zero_eng = a * float(baseline)
+                                            zero_eng = a * float(baseline) + b
                                         except Exception:
                                             zero_eng = 0.0
                                     # Convert to engineered units
                                     data_eng = a * raw + b
-                                    # Properties for this channel
+                                    # Properties for this channel. Use capitalized keys
+                                    # for Description and Unit so they appear in the base
+                                    # properties of NI viewers. Keep the lowercase keys
+                                    # for compatibility with other tools.
                                     props = {
+                                        "Description": sensor_name,
                                         "description": sensor_name,
+                                        "Unit": unit_eng,
                                         "unit_string": unit_eng,
                                         "wf_start_time": datetime.datetime.fromtimestamp(start_time_epoch_s),
                                         "wf_increment": 1.0 / fs,
