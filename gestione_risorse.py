@@ -269,11 +269,44 @@ class ResourceManagerDialog(QtWidgets.QDialog):
 
     def _measure_into_widget(self, spinV: QtWidgets.QDoubleSpinBox):
         ch = self.cmbChannel.currentText().strip()
-        val = self.acq.get_last_value(ch, apply_zero=False)
+        # Se il canale non è abilitato nell'acquisizione principale, chiedi all'utente se abilitarlo
+        parent_win = None
+        try:
+            parent_win = self.parent()
+        except Exception:
+            parent_win = None
+        if parent_win is not None and hasattr(parent_win, 'is_channel_enabled') and hasattr(parent_win, 'enable_physical_channel'):
+            try:
+                if not parent_win.is_channel_enabled(ch):
+                    res = QtWidgets.QMessageBox.question(
+                        self, "Canale non abilitato",
+                        f"Il canale {ch} non è abilitato, vuoi abilitarlo per prendere la misura?",
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        QtWidgets.QMessageBox.Yes)
+                    if res == QtWidgets.QMessageBox.Yes:
+                        try:
+                            parent_win.enable_physical_channel(ch)
+                            # Aggiorna l'acquisizione con la nuova configurazione
+                            parent_win._update_acquisition_from_table()
+                        except Exception:
+                            pass
+                    else:
+                        return
+            except Exception:
+                pass
+        # Procedi a leggere il valore istantaneo
+        val = None
+        try:
+            val = self.acq.get_last_value(ch, apply_zero=False)
+        except Exception:
+            val = None
         if val is None:
             QtWidgets.QMessageBox.warning(self, "Attenzione", "Nessun valore disponibile (acquisizione non attiva?).")
             return
-        spinV.setValue(float(val))  # triggerà _update_plot via valueChanged
+        try:
+            spinV.setValue(float(val))  # triggerà _update_plot via valueChanged
+        except Exception:
+            pass
 
     def _refresh_unit_labels(self):
         unit = self.txtUnit.text().strip()

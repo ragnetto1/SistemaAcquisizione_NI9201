@@ -1,5 +1,7 @@
 # ui.py
 from PyQt5 import QtCore, QtWidgets, QtGui
+import sys
+import configparser
 import shutil  # per rimuovere cartelle temporanee dopo merge
 import pyqtgraph as pg
 from collections import deque
@@ -95,6 +97,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # Track if we are in stall mode to avoid repeated adjustments
         self._stall_active = False
 
+        # Path for the current sensor database. Default to SENSOR_DB_DEFAULT.
+        self._sensor_db_path = SENSOR_DB_DEFAULT
+
         # UI
         self._build_ui()
         self._connect_signals()
@@ -137,6 +142,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # Pulsante per definire i sensori/risorse
         self.btnDefineTypes = QtWidgets.QPushButton("Definisci Tipo Risorsa")
         top.addWidget(self.btnDefineTypes)
+        # Pulsanti per salvare e caricare workspace
+        self.btnSaveWorkspace = QtWidgets.QPushButton("Salva workspace")
+        self.btnLoadWorkspace = QtWidgets.QPushButton("Carica workspace")
+        top.addWidget(self.btnSaveWorkspace)
+        top.addWidget(self.btnLoadWorkspace)
         # Allineamento a destra per riempire lo spazio residuo
         main.addLayout(top)
 
@@ -387,6 +397,13 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.btnClearChart.clicked.connect(self._clear_chart)
         self.btnDefineTypes.clicked.connect(self._open_resource_manager)
 
+        # collegamenti per salvataggio/caricamento workspace
+        try:
+            self.btnSaveWorkspace.clicked.connect(self._save_workspace)
+            self.btnLoadWorkspace.clicked.connect(self._load_workspace)
+        except Exception:
+            pass
+
         # tabella: prima puliamo eventuali collegamenti generici che
         # potrebbero riconfigurare anche quando si rinomina
         try:
@@ -462,6 +479,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                     if self.cmbDevice.itemData(i) == chosen:
                         self.cmbDevice.setCurrentIndex(i)
                         break
+            else:
+                # se l'utente annulla la scelta del dispositivo, termina il programma
+                sys.exit(0)
 
         # come prima: ricostruzione tabella/definizioni/scale
         self._populate_table()
@@ -500,7 +520,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             name -> {unit, a, b}
         """
         defs = {}
-        p = SENSOR_DB_DEFAULT
+        # Use the current sensor DB path if available; fallback to default
+        try:
+            p = self._sensor_db_path
+        except Exception:
+            p = SENSOR_DB_DEFAULT
         if not os.path.isfile(p):
             return defs
         # Determine supported DAQ models for this application.
@@ -1236,11 +1260,347 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Errore", f"Impossibile importare gestione_risorse:\n{e}")
             return
-        dlg = ResourceManagerDialog(self.acq, xml_path=SENSOR_DB_DEFAULT, parent=self)
+        # Apri il dialog con il percorso corrente del database dei sensori
+        try:
+            dlg = ResourceManagerDialog(self.acq, xml_path=self._sensor_db_path, parent=self)
+        except Exception:
+            dlg = ResourceManagerDialog(self.acq, xml_path=SENSOR_DB_DEFAULT, parent=self)
         dlg.exec_()
+        # Se l'utente ha cambiato il percorso del DB, aggiorna la variabile
+        try:
+            if dlg.xml_path:
+                self._sensor_db_path = dlg.xml_path
+        except Exception:
+            pass
         # refresh liste e scale
         self._populate_type_column()
         self._recompute_all_calibrations()
+
+    # ----------------------------- Workspace management -----------------------------
+    def _save_workspace(self):
+        """
+        Salva l'intera configurazione corrente (cartella di salvataggio, nome base,
+        dimensione buffer RAM, frequenza di campionamento, mappatura canali e percorsi DB)
+        in un file INI. Il workspace contiene anche il tag supportedDAQ per la scheda NI9201.
+        """
+        # Scegli file di destinazione
+        try:
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Salva workspace", "", "INI (*.ini)")
+        except Exception:
+            path = ""
+        if not path:
+            return
+        if not path.lower().endswith(".ini"):
+            path += ".ini"
+        cfg = configparser.ConfigParser()
+        cfg['general'] = {}
+        gen = cfg['general']
+        # Percorso DB sensori
+        try:
+            gen['sensor_db_path'] = self._sensor_db_path or ""
+        except Exception:
+            gen['sensor_db_path'] = ""
+        # Scheda compatibile
+        gen['supporteddaq'] = "NI9201"
+        # Directory di salvataggio
+        gen['save_dir'] = self.txtSaveDir.text().strip()
+        # Nome file base
+        gen['base_filename'] = self.txtBaseName.text().strip()
+        # Buffer RAM (MB)
+        try:
+            gen['ram_mb'] = str(int(self.spinRam.value()))
+        except Exception:
+            gen['ram_mb'] = ""
+        # Frequenza di campionamento (può essere stringa vuota o "Max")
+        txt = (self.rateEdit.text() or "").strip()
+        gen['fs'] = txt
+        # Nome del device corrente
+        try:
+            gen['device_name'] = (self.cmbDevice.currentData() or self.cmbDevice.currentText() or "").strip()
+        except Exception:
+            gen['device_name'] = ""
+        # Sezione canali
+        cfg['channels'] = {}
+        chsec = cfg['channels']
+        all_phys = []
+        enabled_list = []
+        type_list = []
+        label_list = []
+        zero_raw_list = []
+        zero_display_list = []
+        for r in range(self.table.rowCount()):
+            # Nome fisico del canale
+            phys = None
+            try:
+                phys = self.table.item(r, COL_PHYS).text()
+            except Exception:
+                phys = f"ai{r}"
+            # Stato abilitazione
+            enable_item = self.table.item(r, COL_ENABLE)
+            enabled = False
+            if enable_item:
+                enabled = (enable_item.checkState() == QtCore.Qt.Checked)
+            # Tipo risorsa
+            cmb = self.table.cellWidget(r, COL_TYPE)
+            typ = ""
+            if isinstance(cmb, QtWidgets.QComboBox):
+                try:
+                    typ = cmb.currentText().strip()
+                except Exception:
+                    typ = ""
+            # Etichetta
+            lbl_item = self.table.item(r, COL_LABEL)
+            label = lbl_item.text().strip() if lbl_item else ""
+            # Zero raw value dall'acquisizione (baseline volt)
+            try:
+                baseline_raw = None
+                if hasattr(self.acq, '_zero'):
+                    baseline_raw = self.acq._zero.get(phys)
+                if baseline_raw is None:
+                    zero_raw_list.append("")
+                else:
+                    zero_raw_list.append(f"{float(baseline_raw):.12g}")
+            except Exception:
+                zero_raw_list.append("")
+            # Zero display value dalla tabella
+            try:
+                zero_item = self.table.item(r, COL_ZERO_VAL)
+                if zero_item:
+                    zero_display_list.append(zero_item.text().strip())
+                else:
+                    zero_display_list.append("")
+            except Exception:
+                zero_display_list.append("")
+            # Aggiungi alle liste
+            all_phys.append(phys)
+            enabled_list.append("1" if enabled else "0")
+            type_list.append(typ)
+            label_list.append(label)
+        chsec['phys'] = ",".join(all_phys)
+        chsec['enabled'] = ",".join(enabled_list)
+        chsec['type'] = ",".join(type_list)
+        chsec['label'] = ",".join(label_list)
+        # Salva anche i valori di azzeramento raw e display
+        chsec['zero_raw'] = ",".join(zero_raw_list)
+        chsec['zero_display'] = ",".join(zero_display_list)
+        # Scrivi su disco
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                cfg.write(f)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Errore", f"Impossibile salvare il workspace:\n{e}")
+            return
+        QtWidgets.QMessageBox.information(self, "Salvato", f"Workspace salvato:\n{path}")
+
+    def _load_workspace(self):
+        """
+        Carica una configurazione da un file INI e applica tutte le impostazioni:
+        cartella di salvataggio, base filename, buffer RAM, frequenza, lista canali e database sensori.
+        Verifica che la scheda supportata sia NI9201.
+        """
+        try:
+            fname, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Carica workspace", "", "INI (*.ini)")
+        except Exception:
+            fname = ""
+        if not fname:
+            return
+        cfg = configparser.ConfigParser()
+        try:
+            cfg.read(fname)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Errore", f"Impossibile leggere workspace:\n{e}")
+            return
+        if 'general' not in cfg:
+            QtWidgets.QMessageBox.critical(self, "Errore", "Il file non contiene la sezione [general].")
+            return
+        gen = cfg['general']
+        supported = (gen.get('supporteddaq', '') or '').strip()
+        if 'NI9201' not in supported.upper():
+            QtWidgets.QMessageBox.critical(self, "Errore", "Il workspace non è compatibile con NI9201.")
+            return
+        # Aggiorna percorso DB sensori
+        sensor_db = gen.get('sensor_db_path', '').strip()
+        if sensor_db:
+            self._sensor_db_path = sensor_db
+        # Directory di salvataggio
+        sd = gen.get('save_dir', '').strip()
+        if sd:
+            self._save_dir = sd
+            self.txtSaveDir.setText(sd)
+        # Nome file base
+        bn = gen.get('base_filename', '').strip()
+        if bn:
+            self._base_filename = bn
+            self.txtBaseName.setText(bn)
+        # Buffer RAM
+        try:
+            ram_mb = int(gen.get('ram_mb', '').strip())
+            if ram_mb > 0:
+                self.spinRam.setValue(ram_mb)
+        except Exception:
+            pass
+        # Frequenza di campionamento
+        fs_txt = gen.get('fs', '').strip()
+        if fs_txt:
+            self.rateEdit.setText(fs_txt)
+            # Applica eventuale update immediato
+            try:
+                self._on_rate_edit_finished()
+            except Exception:
+                pass
+        # Device
+        dev_name = gen.get('device_name', '').strip()
+        if dev_name:
+            for i in range(self.cmbDevice.count()):
+                try:
+                    if (self.cmbDevice.itemData(i) or '').strip() == dev_name:
+                        self.cmbDevice.setCurrentIndex(i)
+                        break
+                except Exception:
+                    pass
+        # Aggiorna tipo risorsa a partire dal DB
+        self._populate_type_column()
+        self._recompute_all_calibrations()
+        # Canali
+        if 'channels' in cfg:
+            chsec = cfg['channels']
+            phys_raw = chsec.get('phys', '')
+            enabled_raw = chsec.get('enabled', '')
+            type_raw = chsec.get('type', '')
+            label_raw = chsec.get('label', '')
+            phys_list = [p.strip() for p in phys_raw.split(',')] if phys_raw else []
+            enabled_list = [e.strip() for e in enabled_raw.split(',')] if enabled_raw else []
+            type_list = [t.strip() for t in type_raw.split(',')] if type_raw else []
+            label_list = [l.strip() for l in label_raw.split(',')] if label_raw else []
+            zero_raw_raw = chsec.get('zero_raw', '')
+            zero_display_raw = chsec.get('zero_display', '')
+            zero_raw_list = [z.strip() for z in zero_raw_raw.split(',')] if zero_raw_raw else []
+            zero_display_list = [z.strip() for z in zero_display_raw.split(',')] if zero_display_raw else []
+            # Mappa temporanea dei baseline da applicare dopo l'avvio dell'acquisizione
+            baseline_raw_map = {}
+            baseline_disp_map = {}
+            # Ricostruisci la tabella
+            self._populate_table()
+            # Aggiorna tipo colonna
+            self._populate_type_column()
+            # Riempimento valori per ogni riga
+            self.table.blockSignals(True)
+            for r in range(self.table.rowCount()):
+                phys = None
+                try:
+                    phys = self.table.item(r, COL_PHYS).text()
+                except Exception:
+                    phys = None
+                if not phys:
+                    continue
+                # indice nei vettori del workspace
+                try:
+                    idx = phys_list.index(phys)
+                except Exception:
+                    idx = -1
+                # Stato abilitazione
+                enable_item = self.table.item(r, COL_ENABLE)
+                if enable_item:
+                    state = False
+                    if idx >= 0 and idx < len(enabled_list):
+                        en_val = enabled_list[idx]
+                        state = en_val.strip().lower() in ('1', 'true')
+                    enable_item.setCheckState(QtCore.Qt.Checked if state else QtCore.Qt.Unchecked)
+                # Tipo risorsa
+                cmb = self.table.cellWidget(r, COL_TYPE)
+                if isinstance(cmb, QtWidgets.QComboBox):
+                    if idx >= 0 and idx < len(type_list):
+                        tval = type_list[idx] or 'Voltage'
+                        pos = cmb.findText(tval)
+                        if pos >= 0:
+                            cmb.setCurrentIndex(pos)
+                        else:
+                            cmb.setEditText(tval)
+                    else:
+                        cmb.setCurrentIndex(0)
+                # Etichetta utente
+                it = self.table.item(r, COL_LABEL)
+                if it is None:
+                    it = QtWidgets.QTableWidgetItem('')
+                    self.table.setItem(r, COL_LABEL, it)
+                if idx >= 0 and idx < len(label_list):
+                    it.setText(label_list[idx])
+                else:
+                    it.setText(phys)
+                # Baseline raw e display: memorizza per applicazione successiva
+                if idx >= 0:
+                    if idx < len(zero_raw_list):
+                        baseline_raw_map[phys] = zero_raw_list[idx]
+                    if idx < len(zero_display_list):
+                        baseline_disp_map[phys] = zero_display_list[idx]
+            self.table.blockSignals(False)
+            # Recompute calibrations e avvia acquisizione con nuovi canali
+            self._recompute_all_calibrations()
+            self._update_acquisition_from_table()
+            # Applica baseline raw e aggiorna colonna 'Valore azzerato'
+            try:
+                for r in range(self.table.rowCount()):
+                    phys_item = self.table.item(r, COL_PHYS)
+                    if phys_item is None:
+                        continue
+                    phys = phys_item.text()
+                    # Ottieni baseline raw come stringa (vuota se None)
+                    br = baseline_raw_map.get(phys, '')
+                    baseline_value = None
+                    if br not in ('', None):
+                        try:
+                            baseline_value = float(br)
+                        except Exception:
+                            baseline_value = None
+                    # Imposta baseline raw nell'acquisition manager
+                    try:
+                        self.acq.set_zero_raw(phys, baseline_value)
+                    except Exception:
+                        pass
+                    # Aggiorna display zero
+                    zero_disp = baseline_disp_map.get(phys, '')
+                    if zero_disp:
+                        self.table.item(r, COL_ZERO_VAL).setText(zero_disp)
+                    else:
+                        # se non c'è display, mostra 0.0 per coerenza
+                        try:
+                            self.table.item(r, COL_ZERO_VAL).setText('0.0')
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        QtWidgets.QMessageBox.information(self, "Caricato", f"Workspace caricato:\n{fname}")
+
+    # ----------------------------- Channel helpers per ResourceManager -----------------------------
+    def is_channel_enabled(self, phys: str) -> bool:
+        """Restituisce True se il canale fisico è abilitato nella tabella."""
+        try:
+            for r in range(self.table.rowCount()):
+                phys_item = self.table.item(r, COL_PHYS)
+                if phys_item and phys_item.text() == phys:
+                    # colonna abilita è una QTableWidgetItem con stato di check
+                    enable_item = self.table.item(r, COL_ENABLE)
+                    if enable_item:
+                        return enable_item.checkState() == QtCore.Qt.Checked
+                    return False
+        except Exception:
+            pass
+        return False
+
+    def enable_physical_channel(self, phys: str):
+        """Abilita il canale fisico nella tabella."""
+        try:
+            for r in range(self.table.rowCount()):
+                phys_item = self.table.item(r, COL_PHYS)
+                if phys_item and phys_item.text() == phys:
+                    enable_item = self.table.item(r, COL_ENABLE)
+                    if enable_item and enable_item.checkState() != QtCore.Qt.Checked:
+                        enable_item.setCheckState(QtCore.Qt.Checked)
+                    break
+        except Exception:
+            pass
 
     # ----------------------------- Valore istantaneo in tabella -----------------------------
     def _update_table_value(self, start_label_name, val_volt_zeroed):
