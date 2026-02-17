@@ -4,6 +4,7 @@ import sys
 import configparser
 import re
 import shutil  # per rimuovere cartelle temporanee dopo merge
+import glob
 import pyqtgraph as pg
 from collections import deque
 import numpy as np
@@ -11,7 +12,13 @@ import os
 import xml.etree.ElementTree as ET
 import datetime
 import json
+import time
 from typing import List, Callable, Optional, Dict, Any, Tuple
+
+try:
+    from syncronizzation import ModuleSyncAgent
+except Exception:
+    ModuleSyncAgent = None
 
 # Path to store persistent configuration. It resides alongside this script.
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
@@ -112,6 +119,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # Path for the current sensor database. Default to SENSOR_DB_DEFAULT.
         self._sensor_db_path = SENSOR_DB_DEFAULT
 
+        # Controllo remoto da chassis (attivo solo se lanciato dal root con env sync).
+        self._sync_agent = None
+        self._sync_remote_active = False
+        self._sync_arm_requested = False
+
         # UI
         self._build_ui()
         self._connect_signals()
@@ -127,6 +139,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # Start backlog monitoring timer
         self._backlog_timer.start()
+
+        # Avvia l'agent solo in modalita chassis-control.
+        self._init_sync_agent()
 
     # ----------------------------- Build UI -----------------------------
     def _build_ui(self):
@@ -449,6 +464,216 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.acq.on_channel_value = lambda name, val: self.channelValueUpdated.emit(name, val)
         self.acq.on_new_instant_block = lambda t, ys, names: self.sigInstantBlock.emit(t, ys, names)
         self.acq.on_new_chart_points = lambda t_pts, ys_pts, names: self.sigChartPoints.emit(t_pts, ys_pts, names)
+
+    def _init_sync_agent(self):
+        if ModuleSyncAgent is None:
+            return
+        try:
+            agent = ModuleSyncAgent(self)
+        except Exception:
+            return
+        if not agent.is_active():
+            return
+
+        self._sync_agent = agent
+        self._sync_agent.register_handler("APPLY_CHASSIS_CONFIG", self._sync_cmd_apply_chassis_config)
+        self._sync_agent.register_handler("PREPARE_SAVE", self._sync_cmd_prepare_save)
+        self._sync_agent.register_handler("CONFIGURE_SYNC", self._sync_cmd_configure_sync)
+        self._sync_agent.register_handler("ARM_ACQUISITION", self._sync_cmd_arm_acquisition)
+        self._sync_agent.register_handler("START_SYNC", self._sync_cmd_start_sync)
+        self._sync_agent.register_handler("START_SAVE", self._sync_cmd_start_save)
+        self._sync_agent.register_handler("STOP_AND_MERGE", self._sync_cmd_stop_and_merge)
+        self._sync_agent.register_handler("UNLOCK_UI", self._sync_cmd_unlock_ui)
+        self._sync_agent.register_handler("ABORT_PREPARED", self._sync_cmd_abort_prepared)
+        self._sync_agent.start(
+            {
+                "board": "NI9201",
+                "pid": int(os.getpid()),
+                "device_name": str(self._forced_device_name_from_env() or ""),
+            }
+        )
+
+    def _is_current_device_simulated(self) -> bool:
+        txt = str(self.cmbDevice.currentText() or "")
+        return "[SIMULATED]" in txt.upper()
+
+    def _set_remote_control_lock(self, lock: bool):
+        lock = bool(lock)
+        self._set_table_lock(lock)
+        self.txtSaveDir.setEnabled(not lock)
+        self.btnBrowseDir.setEnabled(not lock)
+        self.txtBaseName.setEnabled(not lock)
+        self.spinRam.setEnabled(not lock)
+        self.rateEdit.setEnabled(not lock)
+        self.btnDefineTypes.setEnabled(not lock)
+        self.btnSaveWorkspace.setEnabled(not lock)
+        self.btnLoadWorkspace.setEnabled(not lock)
+        forced_device_name = self._forced_device_name_from_env()
+        self.cmbDevice.setEnabled((not lock) and (not bool(forced_device_name)))
+        self.btnRefresh.setEnabled((not lock) and (not bool(forced_device_name)))
+        if lock:
+            self.btnStart.setEnabled(False)
+            self.btnStop.setEnabled(False)
+        else:
+            self.btnStart.setEnabled(not bool(self.acq.recording_enabled))
+            self.btnStop.setEnabled(bool(self.acq.recording_enabled))
+
+    def _run_without_message_boxes(self, fn):
+        orig_info = QtWidgets.QMessageBox.information
+        orig_warn = QtWidgets.QMessageBox.warning
+        orig_crit = QtWidgets.QMessageBox.critical
+
+        def _silent(*_args, **_kwargs):
+            return QtWidgets.QMessageBox.Ok
+
+        try:
+            QtWidgets.QMessageBox.information = _silent
+            QtWidgets.QMessageBox.warning = _silent
+            QtWidgets.QMessageBox.critical = _silent
+            return fn()
+        finally:
+            QtWidgets.QMessageBox.information = orig_info
+            QtWidgets.QMessageBox.warning = orig_warn
+            QtWidgets.QMessageBox.critical = orig_crit
+
+    def _find_latest_tdms(self) -> str:
+        base_dir = str(self._save_dir or "").strip()
+        if not base_dir or not os.path.isdir(base_dir):
+            return ""
+        files = glob.glob(os.path.join(base_dir, "*.tdms"))
+        if not files:
+            return ""
+        try:
+            files.sort(key=lambda p: os.path.getmtime(p))
+        except Exception:
+            files.sort()
+        return files[-1]
+
+    def _sync_cmd_apply_chassis_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        save_dir = str(payload.get("save_dir", "") or "").strip()
+        base_name = str(payload.get("base_filename", "") or "").strip()
+        fs_hz = float(payload.get("fs_hz", 0.0) or 0.0)
+        ram_mb = payload.get("ram_mb", None)
+
+        if save_dir:
+            self.txtSaveDir.setText(save_dir)
+        if base_name:
+            if not base_name.lower().endswith(".tdms"):
+                base_name += ".tdms"
+            self.txtBaseName.setText(base_name)
+        if ram_mb is not None:
+            try:
+                ram_i = int(float(ram_mb))
+                ram_i = max(self.spinRam.minimum(), min(self.spinRam.maximum(), ram_i))
+                self.spinRam.setValue(ram_i)
+            except Exception:
+                pass
+        if fs_hz > 0:
+            self.rateEdit.setText(str(int(round(fs_hz))))
+            self._run_without_message_boxes(self._on_rate_edit_finished)
+
+        return {
+            "device_name": str((self.cmbDevice.currentData() or self.cmbDevice.currentText() or "").strip()),
+            "is_simulated": self._is_current_device_simulated(),
+        }
+
+    def _sync_cmd_prepare_save(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not self._device_ready:
+            raise RuntimeError("Dispositivo non pronto.")
+        phys, _labels = self._enabled_phys_and_labels()
+        if not phys:
+            raise RuntimeError("Nessun canale abilitato.")
+        if not bool(getattr(self.acq, "_running", False)):
+            self._run_without_message_boxes(self._update_acquisition_from_table)
+        if not bool(getattr(self.acq, "_running", False)):
+            raise RuntimeError("Acquisizione non avviata.")
+        return {"channels": len(phys)}
+
+    def _sync_cmd_configure_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        fs_hz = float(payload.get("fs_hz", 0.0) or 0.0)
+        if fs_hz > 0:
+            self.rateEdit.setText(str(int(round(fs_hz))))
+            self._run_without_message_boxes(self._on_rate_edit_finished)
+        return {
+            "hardware_supported": False,
+            "is_simulated": self._is_current_device_simulated(),
+        }
+
+    def _sync_cmd_arm_acquisition(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        fs_hz = float(payload.get("fs_hz", 0.0) or 0.0)
+        if fs_hz > 0:
+            self.rateEdit.setText(str(int(round(fs_hz))))
+            self._run_without_message_boxes(self._on_rate_edit_finished)
+        try:
+            if bool(getattr(self.acq, "_running", False)):
+                self.acq.stop()
+        except Exception:
+            pass
+        phys, _labels = self._enabled_phys_and_labels()
+        if not phys:
+            raise RuntimeError("Nessun canale abilitato per arm.")
+        self._sync_arm_requested = True
+        return {"armed": True, "channels": len(phys)}
+
+    def _sync_cmd_start_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not self._sync_arm_requested:
+            raise RuntimeError("Modulo non armato.")
+        start_epoch_ns = int(payload.get("start_epoch_ns", 0) or 0)
+        if start_epoch_ns > 0:
+            while True:
+                now = time.time_ns()
+                dt_ns = start_epoch_ns - now
+                if dt_ns <= 0:
+                    break
+                if dt_ns > 3_000_000:
+                    time.sleep((dt_ns - 1_000_000) / 1_000_000_000.0)
+                else:
+                    break
+            while time.time_ns() < start_epoch_ns:
+                pass
+        self._run_without_message_boxes(self._update_acquisition_from_table)
+        if not bool(getattr(self.acq, "_running", False)):
+            raise RuntimeError("Start sincronizzato fallito.")
+        self._sync_arm_requested = False
+        return {"running": True, "start_ns": time.time_ns()}
+
+    def _sync_cmd_start_save(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
+        self._sync_remote_active = True
+        self._set_remote_control_lock(True)
+        self._run_without_message_boxes(self._on_start_saving)
+        if not bool(self.acq.recording_enabled):
+            self._sync_remote_active = False
+            self._set_remote_control_lock(False)
+            raise RuntimeError("Salvataggio non avviato.")
+        return {"recording": True}
+
+    def _sync_cmd_stop_and_merge(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
+        before = self._find_latest_tdms()
+        self._run_without_message_boxes(self._on_stop)
+        after = self._find_latest_tdms()
+        self._sync_remote_active = False
+        self._sync_arm_requested = False
+        return {"recording": bool(self.acq.recording_enabled), "final_tdms": after or before}
+
+    def _sync_cmd_unlock_ui(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
+        self._sync_remote_active = False
+        self._sync_arm_requested = False
+        self._set_remote_control_lock(False)
+        return {"unlocked": True}
+
+    def _sync_cmd_abort_prepared(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            self.acq.set_recording(False)
+        except Exception:
+            pass
+        try:
+            self.acq.stop()
+        except Exception:
+            pass
+        self._sync_remote_active = False
+        self._sync_arm_requested = False
+        self._set_remote_control_lock(False)
+        return {"aborted": True}
 
     # ----------------------------- Devices -----------------------------
     def refresh_devices(self):
@@ -1904,6 +2129,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     # ----------------------------- Chiusura ordinata -----------------------------
     def closeEvent(self, event: QtGui.QCloseEvent):
+        try:
+            if self._sync_agent is not None:
+                self._sync_agent.close()
+        except Exception:
+            pass
         # stop timer UI
         try:
             if self.guiTimer.isActive():

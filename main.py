@@ -3,7 +3,14 @@ import importlib.util
 import os
 import sys
 import traceback
+from pathlib import Path
 from typing import Optional, Tuple
+
+
+MODULE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = MODULE_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def main():
