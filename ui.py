@@ -614,28 +614,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
 
-        state = {"reverting": False}
-
-        def _on_selection_changed(new_idx):
-            if state["reverting"]:
-                return
-            if new_idx < 0 or preferred_idx < 0 or new_idx == preferred_idx:
-                return
-
-            answer = QtWidgets.QMessageBox.question(
-                dialog,
-                "Conferma cambio chassis",
-                "Stai selezionando un dispositivo su chassis diverso da quello scelto precedentemente. Continuare?",
-                QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel,
-                QtWidgets.QMessageBox.Cancel,
-            )
-            if answer != QtWidgets.QMessageBox.Ok:
-                state["reverting"] = True
-                cmb.setCurrentIndex(preferred_idx)
-                state["reverting"] = False
-
-        cmb.currentIndexChanged.connect(_on_selection_changed)
-
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return None
 
@@ -665,7 +643,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             return defs
         # Determine supported DAQ models for this application.
         # Il programma deve caricare solo i sensori compatibili con NI9201.
-        supported_daqlist = ["NI9201"]
+        board_tag = "NI9201"
         try:
             tree = ET.parse(p)
             root = tree.getroot()
@@ -688,7 +666,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                     if supported:
                         items = [x.strip().upper() for x in supported.split(",") if x.strip()]
                         # Se NI9201 non ? tra gli elementi, salta questo sensore
-                        if all(item != "NI9201" for item in items):
+                        if all(item != board_tag for item in items):
                             continue
                     else:
                         # Se il tag non esiste o ? vuoto, non includere il sensore
@@ -745,7 +723,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             cur = cmb.currentText()
             cmb.blockSignals(True)
             cmb.clear()
-            cmb.setEditable(True)
+            cmb.setEditable(False)
             cmb.addItem("Voltage")
             for n in names:
                 cmb.addItem(n)
@@ -754,7 +732,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 if idx >= 0:
                     cmb.setCurrentIndex(idx)
                 else:
-                    cmb.setEditText(cur)
+                    cmb.setCurrentIndex(0)
             else:
                 cmb.setCurrentIndex(0)
             cmb.blockSignals(False)
@@ -808,9 +786,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             physItem.setFlags(physItem.flags() & ~QtCore.Qt.ItemIsEditable)
             self.table.setItem(i, COL_PHYS, physItem)
 
-            # Tipo risorsa
+            # Tipo risorsa (selezione vincolata ai sensori supportati + Voltage)
             cmbType = QtWidgets.QComboBox()
-            cmbType.setEditable(True)
+            cmbType.setEditable(False)
             cmbType.addItem("Voltage")
             cmbType.currentTextChanged.connect(lambda _t, row=i: self._type_changed_for_row(row))
             self.table.setCellWidget(i, COL_TYPE, cmbType)
@@ -1823,7 +1801,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                     if pos >= 0:
                         cmb.setCurrentIndex(pos)
                     else:
-                        cmb.setEditText(tval)
+                        cmb.setCurrentIndex(0)
                 else:
                     cmb.setCurrentIndex(0)
 
