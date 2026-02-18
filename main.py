@@ -10,7 +10,8 @@ from typing import Optional, Tuple
 MODULE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MODULE_DIR.parent
 if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+    # Keep module directory precedence so "import main" resolves to ni9201/main.py.
+    sys.path.append(str(REPO_ROOT))
 
 
 def main():

@@ -363,17 +363,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    def closeEvent(self, event):
-        """
-        Reimplement the close event to persist settings before the
-        application terminates.
-        """
-        try:
-            self._save_config()
-        except Exception:
-            pass
-        super().closeEvent(event)
-
     # -------------------------- Backlog/Disk stall check --------------------------
     def _check_backlog(self):
         """
@@ -2129,6 +2118,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     # ----------------------------- Chiusura ordinata -----------------------------
     def closeEvent(self, event: QtGui.QCloseEvent):
+        try:
+            self._save_config()
+        except Exception:
+            pass
         try:
             if self._sync_agent is not None:
                 self._sync_agent.close()
