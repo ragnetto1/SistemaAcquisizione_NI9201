@@ -472,34 +472,38 @@ class AcquisitionManager:
             return False
 
     def stop(self):
-        """Stop immediato: deregistra il callback PRIMA di fermare/chiudere il task."""
+        """Stop immediato robusto anche in fase di chiusura forzata UI."""
         self._closing = True
-        self._running = False
-        self.set_recording(False)
-
-        # stacca il callback per evitare chiamate mentre chiudiamo
-        self._unregister_callbacks()
-        time.sleep(0.01)  # piccolo respiro per drenare callback in volo
-
         try:
-            if self._task:
-                self._task.stop()
-        except Exception:
-            pass
-        try:
-            if self._task:
-                self._task.close()
-        except Exception:
-            pass
-        self._task = None
+            self._running = False
+            self.set_recording(False)
+            self._unregister_callbacks()
 
-        # chiusura writer
-        self._writer_stop.set()
-        self._recording_toggle.set()
-        if self._writer_thread and self._writer_thread.is_alive():
-            self._writer_thread.join(timeout=10)
-        self._writer_thread = None
-        self._closing = False
+            try:
+                if self._task:
+                    self._task.stop()
+            except BaseException:
+                pass
+            try:
+                if self._task:
+                    self._task.close()
+            except BaseException:
+                pass
+            self._task = None
+        finally:
+            # chiusura writer sempre garantita
+            try:
+                self._writer_stop.set()
+                self._recording_toggle.set()
+            except BaseException:
+                pass
+            try:
+                if self._writer_thread and self._writer_thread.is_alive():
+                    self._writer_thread.join(timeout=2.0)
+            except BaseException:
+                pass
+            self._writer_thread = None
+            self._closing = False
 
     def stop_graceful(self, wait_ms: int = 150):
         """

@@ -104,6 +104,10 @@ class ImportStartupUI:
         self._thread = QtCore.QThread(self._window)
         self._worker = ImportWorker()
         self._worker.moveToThread(self._thread)
+        try:
+            self._thread.finished.connect(self._worker.deleteLater)
+        except Exception:
+            pass
 
         self._thread.started.connect(self._worker.run)
         self._worker.sigStepStart.connect(self._on_step_start)

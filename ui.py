@@ -466,6 +466,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         self._sync_agent = agent
         self._sync_agent.register_handler("APPLY_CHASSIS_CONFIG", self._sync_cmd_apply_chassis_config)
+        self._sync_agent.register_handler("STATUS_SNAPSHOT", self._sync_cmd_status_snapshot)
         self._sync_agent.register_handler("PREPARE_SAVE", self._sync_cmd_prepare_save)
         self._sync_agent.register_handler("CONFIGURE_SYNC", self._sync_cmd_configure_sync)
         self._sync_agent.register_handler("ARM_ACQUISITION", self._sync_cmd_arm_acquisition)
@@ -474,6 +475,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._sync_agent.register_handler("STOP_AND_MERGE", self._sync_cmd_stop_and_merge)
         self._sync_agent.register_handler("UNLOCK_UI", self._sync_cmd_unlock_ui)
         self._sync_agent.register_handler("ABORT_PREPARED", self._sync_cmd_abort_prepared)
+        self._sync_agent.register_handler("SHUTDOWN", self._sync_cmd_shutdown)
         self._sync_agent.start(
             {
                 "board": "NI9201",
@@ -481,6 +483,39 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 "device_name": str(self._forced_device_name_from_env() or ""),
             }
         )
+        QtCore.QTimer.singleShot(0, self._sync_emit_status_update)
+
+    def _sync_status_snapshot(self) -> Dict[str, Any]:
+        device_name = str((self.cmbDevice.currentData() or self.cmbDevice.currentText() or "").strip())
+        phys, _labels = self._enabled_phys_and_labels()
+        active_channels = int(len(phys))
+        fs_max_hz = 0.0
+        if device_name and active_channels > 0:
+            try:
+                fs_max_hz = float(self.acq._compute_per_channel_rate(device_name, active_channels))
+            except Exception:
+                try:
+                    fs_max_hz = float(self.acq.current_rate_hz or 0.0)
+                except Exception:
+                    fs_max_hz = 0.0
+        return {
+            "module_id": str(self._sync_agent.module_id() if self._sync_agent is not None else ""),
+            "device_name": device_name,
+            "active_channels": active_channels,
+            "fs_max_hz": float(fs_max_hz if fs_max_hz > 0 else 0.0),
+            "is_simulated": self._is_current_device_simulated(),
+        }
+
+    def _sync_emit_status_update(self):
+        if self._sync_agent is None:
+            return
+        try:
+            self._sync_agent.send_event("STATUS_UPDATE", self._sync_status_snapshot())
+        except Exception:
+            pass
+
+    def _sync_cmd_status_snapshot(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._sync_status_snapshot()
 
     def _is_current_device_simulated(self) -> bool:
         txt = str(self.cmbDevice.currentText() or "")
@@ -561,32 +596,37 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.rateEdit.setText(str(int(round(fs_hz))))
             self._run_without_message_boxes(self._on_rate_edit_finished)
 
-        return {
-            "device_name": str((self.cmbDevice.currentData() or self.cmbDevice.currentText() or "").strip()),
-            "is_simulated": self._is_current_device_simulated(),
-        }
+        snap = self._sync_status_snapshot()
+        self._sync_emit_status_update()
+        return snap
 
     def _sync_cmd_prepare_save(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
         if not self._device_ready:
             raise RuntimeError("Dispositivo non pronto.")
         phys, _labels = self._enabled_phys_and_labels()
         if not phys:
-            raise RuntimeError("Nessun canale abilitato.")
+            snap = self._sync_status_snapshot()
+            snap["eligible"] = False
+            self._sync_emit_status_update()
+            return snap
         if not bool(getattr(self.acq, "_running", False)):
             self._run_without_message_boxes(self._update_acquisition_from_table)
         if not bool(getattr(self.acq, "_running", False)):
             raise RuntimeError("Acquisizione non avviata.")
-        return {"channels": len(phys)}
+        snap = self._sync_status_snapshot()
+        snap["eligible"] = True
+        self._sync_emit_status_update()
+        return snap
 
     def _sync_cmd_configure_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         fs_hz = float(payload.get("fs_hz", 0.0) or 0.0)
         if fs_hz > 0:
             self.rateEdit.setText(str(int(round(fs_hz))))
             self._run_without_message_boxes(self._on_rate_edit_finished)
-        return {
-            "hardware_supported": False,
-            "is_simulated": self._is_current_device_simulated(),
-        }
+        snap = self._sync_status_snapshot()
+        snap["hardware_supported"] = False
+        self._sync_emit_status_update()
+        return snap
 
     def _sync_cmd_arm_acquisition(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         fs_hz = float(payload.get("fs_hz", 0.0) or 0.0)
@@ -602,7 +642,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         if not phys:
             raise RuntimeError("Nessun canale abilitato per arm.")
         self._sync_arm_requested = True
-        return {"armed": True, "channels": len(phys)}
+        snap = self._sync_status_snapshot()
+        snap["armed"] = True
+        self._sync_emit_status_update()
+        return snap
 
     def _sync_cmd_start_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not self._sync_arm_requested:
@@ -624,7 +667,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         if not bool(getattr(self.acq, "_running", False)):
             raise RuntimeError("Start sincronizzato fallito.")
         self._sync_arm_requested = False
-        return {"running": True, "start_ns": time.time_ns()}
+        snap = self._sync_status_snapshot()
+        snap["running"] = True
+        snap["start_ns"] = time.time_ns()
+        self._sync_emit_status_update()
+        return snap
 
     def _sync_cmd_start_save(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
         self._sync_remote_active = True
@@ -634,7 +681,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self._sync_remote_active = False
             self._set_remote_control_lock(False)
             raise RuntimeError("Salvataggio non avviato.")
-        return {"recording": True}
+        snap = self._sync_status_snapshot()
+        snap["recording"] = True
+        self._sync_emit_status_update()
+        return snap
 
     def _sync_cmd_stop_and_merge(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
         before = self._find_latest_tdms()
@@ -642,13 +692,20 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         after = self._find_latest_tdms()
         self._sync_remote_active = False
         self._sync_arm_requested = False
-        return {"recording": bool(self.acq.recording_enabled), "final_tdms": after or before}
+        snap = self._sync_status_snapshot()
+        snap["recording"] = bool(self.acq.recording_enabled)
+        snap["final_tdms"] = after or before
+        self._sync_emit_status_update()
+        return snap
 
     def _sync_cmd_unlock_ui(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
         self._sync_remote_active = False
         self._sync_arm_requested = False
         self._set_remote_control_lock(False)
-        return {"unlocked": True}
+        snap = self._sync_status_snapshot()
+        snap["unlocked"] = True
+        self._sync_emit_status_update()
+        return snap
 
     def _sync_cmd_abort_prepared(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -662,7 +719,17 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._sync_remote_active = False
         self._sync_arm_requested = False
         self._set_remote_control_lock(False)
-        return {"aborted": True}
+        snap = self._sync_status_snapshot()
+        snap["aborted"] = True
+        self._sync_emit_status_update()
+        return snap
+
+    def _sync_cmd_shutdown(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            QtCore.QMetaObject.invokeMethod(self, "close", QtCore.Qt.QueuedConnection)
+        except Exception:
+            QtCore.QTimer.singleShot(0, self.close)
+        return {"shutdown": True}
 
     # ----------------------------- Devices -----------------------------
     def refresh_devices(self):
@@ -747,6 +814,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._populate_type_column()
         self._recompute_all_calibrations()
         self.lblRateInfo.setText("-")
+        self._sync_emit_status_update()
 
     def _abort_startup_on_device_cancel(self):
         # Chiusura pulita del modulo: evita sys.exit immediato mentre Qt
@@ -1158,6 +1226,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 it = self.table.item(r, COL_ENABLE)
                 if it: it.setCheckState(QtCore.Qt.Unchecked)
             self._auto_change = False
+            self._sync_emit_status_update()
             return
 
         # PRENDE SEMPRE IL "NAME" PULITO dal userData della combo
@@ -1167,6 +1236,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         if not phys:
             self._stop_acquisition_ui_only()
             self.lblRateInfo.setText("-")
+            self._sync_emit_status_update()
             return
 
         # If the set of enabled channels has not changed and an acquisition is
@@ -1236,6 +1306,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         self._update_rate_label(phys)
         self._push_sensor_map_to_core()
+        self._sync_emit_status_update()
 
     def _update_rate_label(self, phys_list):
         try:
@@ -1963,6 +2034,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 self._on_rate_edit_finished()
             except Exception:
                 pass
+        self._sync_emit_status_update()
 
         self._populate_type_column()
         self._recompute_all_calibrations()
@@ -2120,40 +2192,52 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event: QtGui.QCloseEvent):
         try:
             self._save_config()
-        except Exception:
+        except BaseException:
             pass
         try:
             if self._sync_agent is not None:
                 self._sync_agent.close()
-        except Exception:
+                self._sync_agent.deleteLater()
+                self._sync_agent = None
+        except BaseException:
             pass
         # stop timer UI
         try:
             if self.guiTimer.isActive():
                 self.guiTimer.stop()
-        except Exception:
+        except BaseException:
+            pass
+        try:
+            if hasattr(self, "_count_timer") and self._count_timer.isActive():
+                self._count_timer.stop()
+        except BaseException:
+            pass
+        try:
+            if hasattr(self, "_backlog_timer") and self._backlog_timer.isActive():
+                self._backlog_timer.stop()
+        except BaseException:
             pass
         # ferma core
         try:
             self.acq.set_recording(False)
-        except Exception:
+        except BaseException:
             pass
         try:
             self.acq.stop()
-        except Exception:
+        except BaseException:
             pass
         # disconnetti segnali
         try:
             self.sigInstantBlock.disconnect()
-        except Exception:
+        except BaseException:
             pass
         try:
             self.sigChartPoints.disconnect()
-        except Exception:
+        except BaseException:
             pass
         try:
             self.channelValueUpdated.disconnect()
-        except Exception:
+        except BaseException:
             pass
         super().closeEvent(event)
 
