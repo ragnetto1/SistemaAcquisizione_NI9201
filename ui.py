@@ -674,6 +674,19 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         return snap
 
     def _sync_cmd_start_save(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
+        start_epoch_ns = int(_payload.get("start_epoch_ns", 0) or 0)
+        if start_epoch_ns > 0:
+            while True:
+                now = time.time_ns()
+                dt_ns = start_epoch_ns - now
+                if dt_ns <= 0:
+                    break
+                if dt_ns > 3_000_000:
+                    time.sleep((dt_ns - 1_000_000) / 1_000_000_000.0)
+                else:
+                    break
+            while time.time_ns() < start_epoch_ns:
+                pass
         self._sync_remote_active = True
         self._set_remote_control_lock(True)
         self._run_without_message_boxes(self._on_start_saving)
@@ -683,6 +696,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             raise RuntimeError("Salvataggio non avviato.")
         snap = self._sync_status_snapshot()
         snap["recording"] = True
+        if start_epoch_ns > 0:
+            snap["requested_start_ns"] = int(start_epoch_ns)
+        snap["recording_start_ns"] = int(time.time_ns())
         self._sync_emit_status_update()
         return snap
 
