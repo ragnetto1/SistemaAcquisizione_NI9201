@@ -102,6 +102,9 @@ class AcquisitionManager:
         # Temporalizzazione sample-accurate
         self._t0_epoch_s: Optional[float] = None  # tempo assoluto del campione #0
         self._global_samples: int = 0             # contatore globale campioni per canale
+        # Sync-only timing controls (used by chassis synchronized mode).
+        self._sync_anchor_epoch_s: Optional[float] = None
+        self._sync_write_start_index: int = 0
 
         # Size in bytes of a single block of samples pushed to the writer queue. This
         # value is computed when the acquisition task starts. It is used to
@@ -127,6 +130,21 @@ class AcquisitionManager:
         self._recording_enabled = bool(enable)
         if prev != self._recording_enabled:
             self._recording_toggle.set()
+
+    def set_sync_anchor_epoch_s(self, epoch_s: Optional[float]) -> None:
+        if epoch_s is None:
+            self._sync_anchor_epoch_s = None
+            return
+        try:
+            self._sync_anchor_epoch_s = float(epoch_s)
+        except Exception:
+            self._sync_anchor_epoch_s = None
+
+    def set_sync_write_start_index(self, start_index: int) -> None:
+        try:
+            self._sync_write_start_index = max(0, int(start_index))
+        except Exception:
+            self._sync_write_start_index = 0
 
     # -------------------- Filename and memory API --------------------
     def set_base_filename(self, base_name: str):
@@ -371,7 +389,13 @@ class AcquisitionManager:
         return float(single_max) if n == 1 else float(agg_max) / n
 
     # -------------------- Start / Stop --------------------
-    def start(self, device_name: str, ai_channels: List[str], channel_names: List[str]) -> bool:
+    def start(
+        self,
+        device_name: str,
+        ai_channels: List[str],
+        channel_names: List[str],
+        sync_start_cfg: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         if nidaqmx is None:
             return False
         if self._running:
@@ -446,6 +470,19 @@ class AcquisitionManager:
                 samps_per_chan=timing_prealloc
             )
             self._task.in_stream.input_buf_size = daq_buf_samps
+
+            # Optional hardware start synchronization across modules in the same chassis.
+            sync_cfg = dict(sync_start_cfg or {})
+            sync_mode = str(sync_cfg.get("sync_mode", "") or "").strip().lower()
+            sync_role = str(sync_cfg.get("sync_role", "") or "").strip().lower()
+            trig_src = str(sync_cfg.get("start_trigger_source", "") or "").strip()
+            if sync_mode == "hardware" and sync_role == "slave":
+                if not trig_src:
+                    raise RuntimeError("Trigger source hardware non valido.")
+                self._task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                    trigger_source=trig_src,
+                    trigger_edge=nidaqmx.constants.Edge.RISING,
+                )
 
             self._reader = AnalogMultiChannelReader(self._task.in_stream)
             self._task.register_every_n_samples_acquired_into_buffer_event(
@@ -608,7 +645,10 @@ class AcquisitionManager:
             # inizializza t0 con l'epoch del PRIMO campione del PRIMO blocco
             if self._t0_epoch_s is None:
                 fs = float(self.current_rate_hz or 1.0)
-                self._t0_epoch_s = (ts_ns / 1e9) - (number_of_samples / fs)
+                if self._sync_anchor_epoch_s is not None:
+                    self._t0_epoch_s = float(self._sync_anchor_epoch_s)
+                else:
+                    self._t0_epoch_s = (ts_ns / 1e9) - (number_of_samples / fs)
 
             # nomi “freeze” allo start (se non presenti, fallback ai fisici)
             start_names = list(self._start_channel_names or self._ai_channels or [])
@@ -807,6 +847,14 @@ class AcquisitionManager:
                             continue
                         # Root and group objects with wf_* properties
                         try:
+                            sync_anchor = float(self._sync_anchor_epoch_s) if self._sync_anchor_epoch_s is not None else float(start_time_epoch_s)
+                        except Exception:
+                            sync_anchor = float(start_time_epoch_s)
+                        try:
+                            sync_cutoff = int(self._sync_write_start_index or 0)
+                        except Exception:
+                            sync_cutoff = 0
+                        try:
                             root = RootObject(properties={
                                 "sample_rate": fs,
                                 "channels": ",".join(tdms_names),
@@ -814,6 +862,8 @@ class AcquisitionManager:
                                 "chunk_offset": int(start_in_file),
                                 "start_time_epoch_s": float(start_time_epoch_s),
                                 "segment_start_time_iso": seg_iso,
+                                "sync_anchor_epoch_s": float(sync_anchor),
+                                "sync_write_cutoff_index": int(sync_cutoff),
                                 # Provide waveform metadata at root level as well
                                 "wf_start_time": datetime.datetime.fromtimestamp(start_time_epoch_s),
                                 "wf_increment": 1.0 / fs,
@@ -929,6 +979,17 @@ class AcquisitionManager:
                     self._recording_toggle.wait(timeout=0.2)
                     self._recording_toggle.clear()
                     continue
+                # Sync hold: while waiting for a valid common cutoff (N0), do not
+                # consume queue blocks. This preserves pre-cutoff samples so all
+                # modules can apply the same cutover index deterministically.
+                try:
+                    gate_idx = int(self._sync_write_start_index or 0)
+                except Exception:
+                    gate_idx = 0
+                if gate_idx >= 10**11:
+                    self._recording_toggle.wait(timeout=0.05)
+                    self._recording_toggle.clear()
+                    continue
                 # Recording active: fetch next block
                 try:
                     start_idx, buf = self._queue.get(timeout=0.2)
@@ -937,6 +998,24 @@ class AcquisitionManager:
                     self._recording_toggle.wait(timeout=0.05)
                     self._recording_toggle.clear()
                     continue
+                # Apply sync write gate by sample index (N0 common cutover).
+                if gate_idx > 0:
+                    try:
+                        n_samp = int(buf.shape[1])
+                    except Exception:
+                        n_samp = 0
+                    end_idx = int(start_idx + max(0, n_samp))
+                    if end_idx <= gate_idx:
+                        continue
+                    if start_idx < gate_idx and n_samp > 0:
+                        cut = int(gate_idx - start_idx)
+                        if cut >= n_samp:
+                            continue
+                        try:
+                            buf = np.ascontiguousarray(buf[:, cut:])
+                        except Exception:
+                            continue
+                        start_idx = gate_idx
                 # Accumulate this block into memory
                 try:
                     self._memory_blocks.append((start_idx, buf))

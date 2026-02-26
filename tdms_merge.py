@@ -35,6 +35,11 @@ class TdmsMerger:
       - Se fs manca ovunque, fallback a 1.0 Hz (evita crash)
     """
 
+    def __init__(self) -> None:
+        # Optional forced start time for merged waveform.
+        # Can be datetime.datetime or epoch seconds (float/int).
+        self.forced_wf_start_time = None
+
     # -------------------- utilità interne --------------------
     def _pick_group(self, td: TdmsFile):
         """Preferisce il gruppo 'Acquisition', altrimenti il primo disponibile."""
@@ -184,7 +189,18 @@ class TdmsMerger:
 
         if ch_names is None:
             raise RuntimeError("Nessun canale valido trovato nei segmenti.")
-        if t0_first is None:
+        forced_t0 = None
+        try:
+            ft = self.forced_wf_start_time
+            if isinstance(ft, datetime.datetime):
+                forced_t0 = ft
+            elif isinstance(ft, (int, float)):
+                forced_t0 = datetime.datetime.fromtimestamp(float(ft))
+        except Exception:
+            forced_t0 = None
+        if forced_t0 is not None:
+            t0_first = forced_t0
+        elif t0_first is None:
             t0_first = datetime.datetime.now()
         if fs is None or fs <= 0:
             fs = 1.0

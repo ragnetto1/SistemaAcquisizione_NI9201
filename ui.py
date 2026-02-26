@@ -123,6 +123,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._sync_agent = None
         self._sync_remote_active = False
         self._sync_arm_requested = False
+        self._pending_sync_start_cfg: Optional[Dict[str, Any]] = None
 
         # UI
         self._build_ui()
@@ -472,6 +473,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._sync_agent.register_handler("ARM_ACQUISITION", self._sync_cmd_arm_acquisition)
         self._sync_agent.register_handler("START_SYNC", self._sync_cmd_start_sync)
         self._sync_agent.register_handler("START_SAVE", self._sync_cmd_start_save)
+        self._sync_agent.register_handler("SET_SYNC_WRITE_CUTOFF", self._sync_cmd_set_sync_write_cutoff)
         self._sync_agent.register_handler("STOP_AND_MERGE", self._sync_cmd_stop_and_merge)
         self._sync_agent.register_handler("UNLOCK_UI", self._sync_cmd_unlock_ui)
         self._sync_agent.register_handler("ABORT_PREPARED", self._sync_cmd_abort_prepared)
@@ -503,7 +505,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             "device_name": device_name,
             "active_channels": active_channels,
             "fs_max_hz": float(fs_max_hz if fs_max_hz > 0 else 0.0),
+            "current_rate_hz": float(getattr(self.acq, "current_rate_hz", 0.0) or 0.0),
             "is_simulated": self._is_current_device_simulated(),
+            "running": bool(getattr(self.acq, "_running", False)),
+            "recording": bool(getattr(self.acq, "recording_enabled", False)),
+            "samples_acquired": int(getattr(self.acq, "_global_samples", 0) or 0),
         }
 
     def _sync_emit_status_update(self):
@@ -624,7 +630,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.rateEdit.setText(str(int(round(fs_hz))))
             self._run_without_message_boxes(self._on_rate_edit_finished)
         snap = self._sync_status_snapshot()
-        snap["hardware_supported"] = False
+        snap["hardware_supported"] = bool(not self._is_current_device_simulated())
         self._sync_emit_status_update()
         return snap
 
@@ -650,8 +656,27 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def _sync_cmd_start_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not self._sync_arm_requested:
             raise RuntimeError("Modulo non armato.")
+        self._set_table_lock(True)
+        start_save_on_sync = bool(payload.get("start_save_on_sync", False))
+        sync_anchor_epoch_ns = int(payload.get("sync_anchor_epoch_ns", 0) or 0)
+        if sync_anchor_epoch_ns > 0:
+            try:
+                self.acq.set_sync_anchor_epoch_s(float(sync_anchor_epoch_ns) / 1e9)
+            except Exception:
+                pass
+        mode = str(payload.get("mode", "software") or "software").strip().lower()
+        sync_role = str(payload.get("sync_role", "") or "").strip().lower()
+        trig_src = str(payload.get("start_trigger_source", "") or "").strip()
+        if mode == "hardware":
+            self._pending_sync_start_cfg = {
+                "sync_mode": "hardware",
+                "sync_role": sync_role,
+                "start_trigger_source": trig_src,
+            }
+        else:
+            self._pending_sync_start_cfg = None
         start_epoch_ns = int(payload.get("start_epoch_ns", 0) or 0)
-        if start_epoch_ns > 0:
+        if start_epoch_ns > 0 and (mode != "hardware" or sync_role == "master"):
             while True:
                 now = time.time_ns()
                 dt_ns = start_epoch_ns - now
@@ -663,13 +688,45 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                     break
             while time.time_ns() < start_epoch_ns:
                 pass
-        self._run_without_message_boxes(self._update_acquisition_from_table)
+        try:
+            self._run_without_message_boxes(self._update_acquisition_from_table)
+        finally:
+            self._pending_sync_start_cfg = None
         if not bool(getattr(self.acq, "_running", False)):
             raise RuntimeError("Start sincronizzato fallito.")
+        if start_save_on_sync:
+            self._sync_remote_active = True
+            self._set_remote_control_lock(True)
+            # Hold writer until root computes common N0 and commits cutoff.
+            try:
+                self.acq.set_sync_write_start_index(10**12)
+            except Exception:
+                pass
+            self._run_without_message_boxes(self._on_start_saving)
+            if not bool(self.acq.recording_enabled):
+                self._sync_remote_active = False
+                self._set_remote_control_lock(False)
+                raise RuntimeError("Salvataggio sync non avviato.")
         self._sync_arm_requested = False
         snap = self._sync_status_snapshot()
         snap["running"] = True
         snap["start_ns"] = time.time_ns()
+        if start_save_on_sync:
+            snap["recording"] = bool(self.acq.recording_enabled)
+        self._sync_emit_status_update()
+        return snap
+
+    def _sync_cmd_set_sync_write_cutoff(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            cutoff = int(payload.get("cutoff_index", 0) or 0)
+        except Exception:
+            cutoff = 0
+        try:
+            self.acq.set_sync_write_start_index(cutoff)
+        except Exception:
+            pass
+        snap = self._sync_status_snapshot()
+        snap["sync_cutoff_index"] = int(cutoff)
         self._sync_emit_status_update()
         return snap
 
@@ -726,6 +783,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def _sync_cmd_abort_prepared(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
             self.acq.set_recording(False)
+        except Exception:
+            pass
+        try:
+            self.acq.set_sync_write_start_index(0)
+            self.acq.set_sync_anchor_epoch_s(None)
         except Exception:
             pass
         try:
@@ -1273,7 +1335,13 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-        ok = self.acq.start(device_name=device, ai_channels=phys, channel_names=labels)
+        sync_cfg = dict(self._pending_sync_start_cfg or {})
+        ok = self.acq.start(
+            device_name=device,
+            ai_channels=phys,
+            channel_names=labels,
+            sync_start_cfg=sync_cfg if sync_cfg else None,
+        )
         if not ok:
             QtWidgets.QMessageBox.critical(self, "Errore", "Impossibile avviare l'acquisizione.")
             return
@@ -1588,6 +1656,17 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         try:
             from tdms_merge import TdmsMerger
             merger = TdmsMerger()
+            try:
+                anchor = getattr(self.acq, "_sync_anchor_epoch_s", None)
+                cutoff = int(getattr(self.acq, "_sync_write_start_index", 0) or 0)
+                fs = float(getattr(self.acq, "current_rate_hz", 0.0) or 0.0)
+                if anchor is not None:
+                    forced = float(anchor)
+                    if cutoff > 0 and fs > 0:
+                        forced += float(cutoff) / float(fs)
+                    merger.forced_wf_start_time = datetime.datetime.fromtimestamp(forced)
+            except Exception:
+                pass
             # Progress dialog
             dlg = QtWidgets.QProgressDialog("Unione file TDMS in corso...", "Annulla", 0, 1, self)
             dlg.setWindowTitle("Unione in corso")
@@ -1623,6 +1702,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Errore ricomposizione", str(e))
         finally:
             self._active_subdir = None
+            try:
+                self.acq.set_sync_write_start_index(0)
+                self.acq.set_sync_anchor_epoch_s(None)
+            except Exception:
+                pass
 
         self._set_table_lock(False)
         self._uncheck_all_enabled()
