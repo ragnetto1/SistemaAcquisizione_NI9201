@@ -15,6 +15,9 @@ import json
 import time
 from typing import List, Callable, Optional, Dict, Any, Tuple
 
+from calculated_channels_engine import CalculatedChannelsEngine
+from formula_editor_dialog import FormulaEditorDialog
+
 try:
     from syncronizzation import ModuleSyncAgent
 except Exception:
@@ -40,6 +43,19 @@ COL_LABEL    = 3   # Nome canale (etichetta utente)
 COL_VALUE    = 4   # Valore istantaneo (con unit? se selezionata)
 COL_ZERO_BTN = 5
 COL_ZERO_VAL = 6
+
+# Colonne tabella canali calcolati
+CCOL_ENABLE = 0
+CCOL_ID = 1
+CCOL_FORMULA = 2
+CCOL_LABEL = 3
+CCOL_VALUE = 4
+CCOL_ZERO_BTN = 5
+CCOL_ZERO_VAL = 6
+CCOL_PLOT = 7
+
+MAX_CALCULATED_CHANNELS = 30
+DEFAULT_CALCULATED_ROWS = 4
 
 # Percorso di default richiesto
 DEFAULT_SAVE_DIR = r"C:\UG-WORK\SistemaAcquisizione_NI9201"
@@ -94,6 +110,17 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._instant_y_by_phys = {f"ai{i}": np.array([], dtype=float) for i in range(8)}
         self._chart_curves_by_phys = {}
         self._instant_curves_by_phys = {}
+        self._chart_y_by_calc: Dict[str, deque] = {}
+        self._instant_y_by_calc: Dict[str, np.ndarray] = {}
+        self._chart_curves_by_calc: Dict[str, Any] = {}
+        self._instant_curves_by_calc: Dict[str, Any] = {}
+        self._calc_last_value_raw: Dict[str, float] = {}
+        self._calc_zero_by_cc: Dict[str, Optional[float]] = {}
+        self._calc_formula_by_cc: Dict[str, str] = {}
+        self._calc_compile_errors: Dict[str, str] = {}
+        self._calc_runtime_errors: Dict[str, str] = {}
+        self._calc_engine = CalculatedChannelsEngine(max_channels=MAX_CALCULATED_CHANNELS)
+        self._building_calc_table = False
 
         # TDMS saving
         self._save_dir = DEFAULT_SAVE_DIR
@@ -128,6 +155,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # UI
         self._build_ui()
         self._connect_signals()
+        self._populate_calc_table(reset=True)
+        self._rebuild_calc_engine(update_core=True)
 
         # Load persistent configuration (if available)
         try:
@@ -194,6 +223,26 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         v.addWidget(self.table)
         self.tabs.addTab(tabTable, "Canali")
 
+        # Tab Canali calcolati
+        tabCalc = QtWidgets.QWidget()
+        vcalc = QtWidgets.QVBoxLayout(tabCalc)
+        self.calcTable = QtWidgets.QTableWidget(0, 8)
+        self.calcTable.setHorizontalHeaderLabels([
+            "Abilita", "Canale calcolato", "Formula", "Nome canale",
+            "Valore istantaneo", "Azzeramento", "Valore azzerato", "Visualizza nel grafico"
+        ])
+        self.calcTable.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+        self.calcTable.horizontalHeader().setStretchLastSection(True)
+        vcalc.addWidget(self.calcTable, 1)
+        calcBtns = QtWidgets.QHBoxLayout()
+        calcBtns.addStretch(1)
+        self.btnAddCalcChannel = QtWidgets.QPushButton("Aggiungi canale di calcolo")
+        self.btnResetCalc = QtWidgets.QPushButton("Reset calcoli")
+        calcBtns.addWidget(self.btnAddCalcChannel)
+        calcBtns.addWidget(self.btnResetCalc)
+        vcalc.addLayout(calcBtns)
+        self.tabs.addTab(tabCalc, "Canali Calcolati")
+
         # Tab Grafici: sotto-tab (chart + instant)
         tabPlots = QtWidgets.QTabWidget()
 
@@ -217,6 +266,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         vchart.addWidget(self.lblAvgChart)
         hctrl = QtWidgets.QHBoxLayout()
         self.btnClearChart = QtWidgets.QPushButton("Pulizia grafico")
+        self.chkCalcViewEnable = QtWidgets.QCheckBox("Abilita visualizzazione canali calcolati")
+        self.chkCalcViewEnable.setChecked(False)
+        hctrl.addWidget(self.chkCalcViewEnable)
         hctrl.addStretch(1)
         hctrl.addWidget(self.btnClearChart)
         vchart.addLayout(hctrl)
@@ -278,6 +330,12 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.guiTimer = QtCore.QTimer(self)
         self.guiTimer.setInterval(100)
         self.guiTimer.timeout.connect(self._refresh_plots)
+
+        # Relayout throttled per widget embedded nelle celle (bottoni/combo/spinbox).
+        self._cell_widget_relayout_timer = QtCore.QTimer(self)
+        self._cell_widget_relayout_timer.setSingleShot(True)
+        self._cell_widget_relayout_timer.setInterval(0)
+        self._cell_widget_relayout_timer.timeout.connect(self._realign_embedded_cell_widgets)
 
         # Status bar + etichetta sempre visibile con rate
         self.statusBar = QtWidgets.QStatusBar()
@@ -418,6 +476,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.btnStop.clicked.connect(self._on_stop)
         self.btnClearChart.clicked.connect(self._clear_chart)
         self.btnDefineTypes.clicked.connect(self._open_resource_manager)
+        self.btnAddCalcChannel.clicked.connect(self._on_add_calc_channel)
+        self.btnResetCalc.clicked.connect(self._on_reset_calculated_channels)
+        self.chkCalcViewEnable.toggled.connect(self._on_calc_view_toggled)
 
         # collegamenti per salvataggio/caricamento workspace
         try:
@@ -437,6 +498,12 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self.table.itemChanged.connect(self._on_table_item_changed)
+        try:
+            self.calcTable.itemChanged.disconnect()
+        except Exception:
+            pass
+        self.calcTable.itemChanged.connect(self._on_calc_item_changed)
+        self.calcTable.cellDoubleClicked.connect(self._on_calc_cell_double_clicked)
 
         self.cmbDevice.currentIndexChanged.connect(self._on_device_changed)
 
@@ -454,6 +521,531 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.acq.on_channel_value = lambda name, val: self.channelValueUpdated.emit(name, val)
         self.acq.on_new_instant_block = lambda t, ys, names: self.sigInstantBlock.emit(t, ys, names)
         self.acq.on_new_chart_points = lambda t_pts, ys_pts, names: self.sigChartPoints.emit(t_pts, ys_pts, names)
+        self._connect_embedded_widget_relayout()
+        self._schedule_embedded_widget_relayout()
+
+    def _connect_embedded_widget_relayout(self) -> None:
+        header_pairs = [
+            (self.table.horizontalHeader(), "sectionResized"),
+            (self.table.verticalHeader(), "sectionResized"),
+            (self.calcTable.horizontalHeader(), "sectionResized"),
+            (self.calcTable.verticalHeader(), "sectionResized"),
+        ]
+        for obj, sig_name in header_pairs:
+            try:
+                getattr(obj, sig_name).connect(lambda *_: self._schedule_embedded_widget_relayout())
+            except Exception:
+                pass
+        for bar in (
+            self.table.horizontalScrollBar(),
+            self.table.verticalScrollBar(),
+            self.calcTable.horizontalScrollBar(),
+            self.calcTable.verticalScrollBar(),
+        ):
+            try:
+                bar.valueChanged.connect(lambda *_: self._schedule_embedded_widget_relayout())
+            except Exception:
+                pass
+
+    def _schedule_embedded_widget_relayout(self) -> None:
+        try:
+            self._cell_widget_relayout_timer.start()
+        except Exception:
+            pass
+
+    def _realign_embedded_widgets_for_table(self, table: QtWidgets.QTableWidget, columns: List[int]) -> None:
+        model = table.model()
+        if model is None:
+            return
+        for row in range(table.rowCount()):
+            for col in columns:
+                widget = table.cellWidget(row, col)
+                if widget is None:
+                    continue
+                idx = model.index(row, col)
+                rect = table.visualRect(idx)
+                if rect.isValid() and rect.width() > 0 and rect.height() > 0:
+                    widget.setGeometry(rect)
+
+    def _realign_embedded_cell_widgets(self) -> None:
+        try:
+            self._realign_embedded_widgets_for_table(self.table, [COL_TYPE, COL_ZERO_BTN])
+        except Exception:
+            pass
+        try:
+            self._realign_embedded_widgets_for_table(self.calcTable, [CCOL_ZERO_BTN])
+        except Exception:
+            pass
+
+    # ----------------------------- Canali calcolati -----------------------------
+    def _calc_channel_id_for_row(self, row: int) -> str:
+        item = self.calcTable.item(row, CCOL_ID)
+        return str(item.text().strip() if item else f"cc{row}")
+
+    def _find_calc_row_by_cc(self, channel_id: str) -> int:
+        for r in range(self.calcTable.rowCount()):
+            if self._calc_channel_id_for_row(r) == channel_id:
+                return r
+        return -1
+
+    def _existing_channel_names_lower(self, exclude_phys_row: Optional[int] = None, exclude_calc_row: Optional[int] = None) -> List[str]:
+        out: List[str] = []
+        for r in range(self.table.rowCount()):
+            if exclude_phys_row is not None and r == exclude_phys_row:
+                continue
+            it = self.table.item(r, COL_LABEL)
+            if it:
+                txt = (it.text() or "").strip()
+                if txt:
+                    out.append(txt.lower())
+        for r in range(self.calcTable.rowCount()):
+            if exclude_calc_row is not None and r == exclude_calc_row:
+                continue
+            it = self.calcTable.item(r, CCOL_LABEL)
+            if it:
+                txt = (it.text() or "").strip()
+                if txt:
+                    out.append(txt.lower())
+        return out
+
+    def _dedupe_channel_name(self, base_name: str, existing_lower: List[str]) -> str:
+        base = str(base_name or "").strip()
+        if not base:
+            base = "channel"
+        candidate = base
+        suffix = 2
+        existing = set(existing_lower or [])
+        while candidate.lower() in existing:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        return candidate
+
+    def _populate_calc_table(self, reset: bool = False) -> None:
+        self._building_calc_table = True
+        try:
+            if reset:
+                self.calcTable.setRowCount(0)
+                self._calc_formula_by_cc.clear()
+                self._calc_zero_by_cc.clear()
+                self._calc_last_value_raw.clear()
+                try:
+                    self._calc_engine.reset_all_state()
+                except Exception:
+                    pass
+                for idx in range(DEFAULT_CALCULATED_ROWS):
+                    self._append_calc_row(idx)
+            elif self.calcTable.rowCount() <= 0:
+                for idx in range(DEFAULT_CALCULATED_ROWS):
+                    self._append_calc_row(idx)
+        finally:
+            self._building_calc_table = False
+        self._rebuild_calc_engine(update_core=True)
+        self._schedule_embedded_widget_relayout()
+
+    def _append_calc_row(self, idx: int) -> None:
+        if self.calcTable.rowCount() >= MAX_CALCULATED_CHANNELS:
+            return
+        row = self.calcTable.rowCount()
+        self.calcTable.insertRow(row)
+        cc_id = f"cc{int(idx)}"
+
+        it_enable = QtWidgets.QTableWidgetItem()
+        it_enable.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+        it_enable.setCheckState(QtCore.Qt.Unchecked)
+        self.calcTable.setItem(row, CCOL_ENABLE, it_enable)
+
+        it_id = QtWidgets.QTableWidgetItem(cc_id)
+        it_id.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+        self.calcTable.setItem(row, CCOL_ID, it_id)
+
+        it_formula = QtWidgets.QTableWidgetItem("")
+        it_formula.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+        it_formula.setToolTip("")
+        self.calcTable.setItem(row, CCOL_FORMULA, it_formula)
+        self._calc_formula_by_cc.setdefault(cc_id, "")
+
+        default_name = cc_id
+        dedup_name = self._dedupe_channel_name(default_name, self._existing_channel_names_lower(exclude_calc_row=row))
+        it_label = QtWidgets.QTableWidgetItem(dedup_name)
+        it_label.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsEditable)
+        self.calcTable.setItem(row, CCOL_LABEL, it_label)
+
+        it_val = QtWidgets.QTableWidgetItem("-")
+        it_val.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+        self.calcTable.setItem(row, CCOL_VALUE, it_val)
+
+        btn_zero = QtWidgets.QPushButton("Azzeramento")
+        btn_zero.clicked.connect(lambda _=False, cc=cc_id: self._on_zero_calc_button_clicked(cc))
+        self.calcTable.setCellWidget(row, CCOL_ZERO_BTN, btn_zero)
+
+        it_zero = QtWidgets.QTableWidgetItem("0.0")
+        it_zero.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+        self.calcTable.setItem(row, CCOL_ZERO_VAL, it_zero)
+
+        it_plot = QtWidgets.QTableWidgetItem()
+        it_plot.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable)
+        it_plot.setCheckState(QtCore.Qt.Unchecked)
+        self.calcTable.setItem(row, CCOL_PLOT, it_plot)
+
+        self._calc_zero_by_cc.setdefault(cc_id, None)
+        self._schedule_embedded_widget_relayout()
+
+    def _on_add_calc_channel(self) -> None:
+        if self.calcTable.rowCount() >= MAX_CALCULATED_CHANNELS:
+            QtWidgets.QMessageBox.warning(self, "Limite raggiunto", f"Numero massimo canali calcolati: {MAX_CALCULATED_CHANNELS}.")
+            return
+        self._building_calc_table = True
+        try:
+            self._append_calc_row(self.calcTable.rowCount())
+        finally:
+            self._building_calc_table = False
+        self._rebuild_calc_engine(update_core=True)
+        self._sync_calc_plot_curves()
+
+    def _on_reset_calculated_channels(self) -> None:
+        self._populate_calc_table(reset=True)
+        self._sync_calc_plot_curves()
+
+    def _preview_formula_text(self, text: str) -> str:
+        s = str(text or "").replace("\r\n", " ").replace("\n", " ").strip()
+        if len(s) <= 48:
+            return s
+        return s[:45] + "..."
+
+    def _collect_calc_formula_map(self) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for r in range(self.calcTable.rowCount()):
+            cc = self._calc_channel_id_for_row(r)
+            out[cc] = str(self._calc_formula_by_cc.get(cc, "") or "").strip()
+        return out
+
+    def _refresh_calc_engine_enabled(self) -> None:
+        enabled_ids: List[str] = []
+        for r in range(self.calcTable.rowCount()):
+            cc = self._calc_channel_id_for_row(r)
+            formula = str(self._calc_formula_by_cc.get(cc, "") or "").strip()
+            if cc in self._calc_compile_errors:
+                continue
+            it = self.calcTable.item(r, CCOL_ENABLE)
+            if it is not None and it.checkState() == QtCore.Qt.Checked and formula:
+                enabled_ids.append(cc)
+        try:
+            self._calc_engine.set_enabled_channels(enabled_ids)
+        except Exception:
+            pass
+
+    def _dummy_formula_inputs(self) -> Dict[str, np.ndarray]:
+        n = 64
+        t = np.linspace(0.0, 1.0, n, dtype=np.float64)
+        out: Dict[str, np.ndarray] = {}
+        for i in range(8):
+            out[f"ai{i}"] = np.sin((i + 1) * 2.0 * np.pi * t)
+        return out
+
+    def _set_calc_row_error(self, row: int, message: str) -> None:
+        msg = str(message or "Formula non valida.")
+        red = QtGui.QColor("#ffd9d9")
+        for col in (CCOL_FORMULA, CCOL_LABEL, CCOL_VALUE):
+            it = self.calcTable.item(row, col)
+            if it is not None:
+                it.setBackground(red)
+                it.setToolTip(msg if col == CCOL_FORMULA else "")
+
+    def _clear_calc_row_error(self, row: int) -> None:
+        white = QtGui.QColor("#ffffff")
+        for col in (CCOL_FORMULA, CCOL_LABEL, CCOL_VALUE):
+            it = self.calcTable.item(row, col)
+            if it is not None:
+                it.setBackground(white)
+                if col == CCOL_FORMULA:
+                    it.setToolTip(str(self._calc_formula_by_cc.get(self._calc_channel_id_for_row(row), "") or ""))
+
+    def _apply_calc_row_flags(self, row: int) -> None:
+        cc = self._calc_channel_id_for_row(row)
+        formula = str(self._calc_formula_by_cc.get(cc, "") or "").strip()
+        err = str(self._calc_compile_errors.get(cc, "") or "")
+        enable_item = self.calcTable.item(row, CCOL_ENABLE)
+        if enable_item is None:
+            return
+        if formula and not err:
+            enable_item.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable)
+        else:
+            enable_item.setCheckState(QtCore.Qt.Unchecked)
+            enable_item.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+        if err:
+            self._set_calc_row_error(row, err)
+        else:
+            self._clear_calc_row_error(row)
+
+    def _rebuild_calc_engine(self, update_core: bool = False, test_runtime: bool = False) -> bool:
+        formula_map = self._collect_calc_formula_map()
+        compile_errors = self._calc_engine.configure(formula_map)
+        self._calc_compile_errors = dict(compile_errors)
+        runtime_errors: Dict[str, str] = {}
+        if test_runtime:
+            try:
+                probe = CalculatedChannelsEngine(max_channels=MAX_CALCULATED_CHANNELS)
+                probe.configure(formula_map)
+                probe.set_enabled_channels(list(formula_map.keys()), reset_disabled=False)
+                _, runtime_errors = probe.evaluate(
+                    self._dummy_formula_inputs(),
+                    float(getattr(self.acq, "current_rate_hz", 0.0) or 1.0),
+                    fill_value=0.0,
+                )
+            except Exception:
+                runtime_errors = {}
+        for cc, err in runtime_errors.items():
+            if cc.startswith("cc") and formula_map.get(cc, "").strip():
+                self._calc_compile_errors[cc] = err
+
+        self._building_calc_table = True
+        try:
+            for r in range(self.calcTable.rowCount()):
+                self._apply_calc_row_flags(r)
+        finally:
+            self._building_calc_table = False
+        self._refresh_calc_engine_enabled()
+
+        if update_core:
+            self._push_calculated_channels_to_core()
+
+        self._rebuild_legends()
+        self._sync_calc_plot_curves()
+        return len(self._calc_compile_errors) == 0
+
+    def _on_calc_cell_double_clicked(self, row: int, col: int) -> None:
+        if col != CCOL_FORMULA:
+            return
+        self._open_calc_formula_editor(row)
+
+    def _open_calc_formula_editor(self, row: int) -> None:
+        cc = self._calc_channel_id_for_row(row)
+        current = str(self._calc_formula_by_cc.get(cc, "") or "")
+        dlg = FormulaEditorDialog(channel_id=cc, formula_text=current, parent=self)
+        while True:
+            dlg.clear_error()
+            if dlg.exec_() != QtWidgets.QDialog.Accepted:
+                return
+            formula = str(dlg.formula_text() or "")
+            self._calc_formula_by_cc[cc] = formula
+            preview = self._preview_formula_text(formula)
+            it = self.calcTable.item(row, CCOL_FORMULA)
+            if it is None:
+                it = QtWidgets.QTableWidgetItem("")
+                self.calcTable.setItem(row, CCOL_FORMULA, it)
+            it.setText(preview)
+            it.setToolTip(formula)
+            ok = self._rebuild_calc_engine(update_core=True, test_runtime=True)
+            err = str(self._calc_compile_errors.get(cc, "") or "")
+            if err:
+                QtWidgets.QMessageBox.warning(self, "Formula non valida", err)
+                dlg.show_error(err)
+                continue
+            if not ok:
+                dlg.show_error("Formula non valida.")
+                continue
+            return
+
+    def _on_calc_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if item is None:
+            return
+        if self._building_calc_table or self._auto_change:
+            return
+
+        row = item.row()
+        col = item.column()
+        cc = self._calc_channel_id_for_row(row)
+
+        if col == CCOL_ENABLE:
+            formula = str(self._calc_formula_by_cc.get(cc, "") or "").strip()
+            err = str(self._calc_compile_errors.get(cc, "") or "")
+            if not formula or err:
+                self._auto_change = True
+                item.setCheckState(QtCore.Qt.Unchecked)
+                self._auto_change = False
+                if err:
+                    QtWidgets.QMessageBox.warning(self, "Formula non valida", err)
+            enabled = bool(item.checkState() == QtCore.Qt.Checked)
+            if not enabled:
+                # Disabilitazione: reset immediato del canale calcolato a zero.
+                self._calc_last_value_raw[cc] = 0.0
+                self._calc_zero_by_cc[cc] = None
+                try:
+                    it_val = self.calcTable.item(row, CCOL_VALUE)
+                    if it_val is not None:
+                        it_val.setText("0.0")
+                    it_zero = self.calcTable.item(row, CCOL_ZERO_VAL)
+                    if it_zero is not None:
+                        it_zero.setText("0.0")
+                except Exception:
+                    pass
+            self._refresh_calc_engine_enabled()
+            self._push_calculated_channels_to_core()
+            self._sync_calc_plot_curves()
+            return
+
+        if col == CCOL_LABEL:
+            entered = (item.text() or "").strip() or cc
+            dedup = self._dedupe_channel_name(entered, self._existing_channel_names_lower(exclude_calc_row=row))
+            if dedup != entered:
+                self._auto_change = True
+                item.setText(dedup)
+                self._auto_change = False
+            self._push_calculated_channels_to_core()
+            self._rebuild_legends()
+            self._sync_calc_plot_curves()
+            return
+
+        if col == CCOL_PLOT:
+            self._sync_calc_plot_curves()
+            return
+
+    def _on_zero_calc_button_clicked(self, channel_id: str) -> None:
+        cc = str(channel_id or "").strip()
+        if not cc:
+            return
+        last = self._calc_last_value_raw.get(cc, None)
+        row = self._find_calc_row_by_cc(cc)
+        if row < 0:
+            return
+        if last is None:
+            self._calc_zero_by_cc[cc] = 0.0
+            try:
+                self.calcTable.item(row, CCOL_ZERO_VAL).setText("0.0")
+            except Exception:
+                pass
+            return
+        self._calc_zero_by_cc[cc] = float(last)
+        try:
+            self.calcTable.item(row, CCOL_ZERO_VAL).setText(f"{float(last):.6g}")
+        except Exception:
+            pass
+
+    def _calc_rows_payload(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for r in range(self.calcTable.rowCount()):
+            cc = self._calc_channel_id_for_row(r)
+            it_enable = self.calcTable.item(r, CCOL_ENABLE)
+            it_plot = self.calcTable.item(r, CCOL_PLOT)
+            it_label = self.calcTable.item(r, CCOL_LABEL)
+            rows.append(
+                {
+                    "channel_id": cc,
+                    "formula": str(self._calc_formula_by_cc.get(cc, "") or ""),
+                    "enabled": bool(it_enable and it_enable.checkState() == QtCore.Qt.Checked),
+                    "plot_enabled": bool(it_plot and it_plot.checkState() == QtCore.Qt.Checked),
+                    "name": str((it_label.text() if it_label else cc) or cc).strip() or cc,
+                    "zero": self._calc_zero_by_cc.get(cc, None),
+                }
+            )
+        return rows
+
+    def _push_calculated_channels_to_core(self) -> None:
+        try:
+            if hasattr(self.acq, "set_calculated_channels"):
+                self.acq.set_calculated_channels(self._calc_rows_payload())
+        except Exception:
+            pass
+
+    def _on_calc_view_toggled(self, _checked: bool) -> None:
+        self._sync_calc_plot_curves()
+
+    def _calc_visible_ids(self) -> List[str]:
+        if not bool(self.chkCalcViewEnable.isChecked()):
+            return []
+        out: List[str] = []
+        for r in range(self.calcTable.rowCount()):
+            cc = self._calc_channel_id_for_row(r)
+            formula = str(self._calc_formula_by_cc.get(cc, "") or "").strip()
+            if not formula:
+                continue
+            if cc in self._calc_compile_errors:
+                continue
+            it_enable = self.calcTable.item(r, CCOL_ENABLE)
+            it_plot = self.calcTable.item(r, CCOL_PLOT)
+            if not it_enable or it_enable.checkState() != QtCore.Qt.Checked:
+                continue
+            if not it_plot or it_plot.checkState() != QtCore.Qt.Checked:
+                continue
+            out.append(cc)
+        return out
+
+    def _sync_calc_plot_curves(self) -> None:
+        visible = set(self._calc_visible_ids())
+
+        for cc in list(self._chart_curves_by_calc.keys()):
+            if cc in visible:
+                continue
+            try:
+                self.pgChart.removeItem(self._chart_curves_by_calc[cc])
+            except Exception:
+                pass
+            self._chart_curves_by_calc.pop(cc, None)
+        for cc in list(self._instant_curves_by_calc.keys()):
+            if cc in visible:
+                continue
+            try:
+                self.pgInstant.removeItem(self._instant_curves_by_calc[cc])
+            except Exception:
+                pass
+            self._instant_curves_by_calc.pop(cc, None)
+
+        phys_count = max(1, len(self._current_phys_order))
+        for idx, cc in enumerate(sorted(visible, key=lambda x: int(x[2:]) if x[2:].isdigit() else 0)):
+            if cc not in self._chart_y_by_calc:
+                self._chart_y_by_calc[cc] = deque(maxlen=12000)
+            if cc not in self._instant_y_by_calc:
+                self._instant_y_by_calc[cc] = np.array([], dtype=float)
+            label_item = self.calcTable.item(self._find_calc_row_by_cc(cc), CCOL_LABEL)
+            label = str(label_item.text().strip() if label_item else cc) or cc
+            color = pg.intColor(phys_count + idx, hues=max(16, phys_count + len(visible)))
+            if cc not in self._chart_curves_by_calc:
+                c = self.pgChart.plot(name=label, pen=pg.mkPen(color=color, width=1.3))
+                self._chart_curves_by_calc[cc] = c
+            if cc not in self._instant_curves_by_calc:
+                ic = self.pgInstant.plot(name=label, pen=pg.mkPen(color=color, width=1.3))
+                self._instant_curves_by_calc[cc] = ic
+        self._rebuild_legends()
+
+    def _evaluate_calculated_block(self, phys_eng: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        fs = float(getattr(self.acq, "current_rate_hz", 0.0) or 0.0)
+        enabled_phys, _ = self._enabled_phys_and_labels()
+        inputs = {k: v for k, v in phys_eng.items() if k in set(enabled_phys)}
+        outputs, errors = self._calc_engine.evaluate(inputs, fs, fill_value=0.0)
+        self._calc_runtime_errors = {k: v for k, v in errors.items() if str(k).startswith("cc")}
+
+        out_shifted: Dict[str, np.ndarray] = {}
+        for cc, arr in outputs.items():
+            a = np.asarray(arr, dtype=np.float64)
+            if a.ndim == 0:
+                a = np.asarray([float(a)], dtype=np.float64)
+            baseline = self._calc_zero_by_cc.get(cc, None)
+            raw_last = float(a[-1]) if a.size > 0 else 0.0
+            self._calc_last_value_raw[cc] = raw_last
+            if baseline is not None:
+                a = a - float(baseline)
+            out_shifted[cc] = np.ascontiguousarray(a, dtype=np.float64)
+        return out_shifted
+
+    def _update_calc_table_values(self, calc_data: Dict[str, np.ndarray]) -> None:
+        self._building_calc_table = True
+        try:
+            for r in range(self.calcTable.rowCount()):
+                cc = self._calc_channel_id_for_row(r)
+                it_enable = self.calcTable.item(r, CCOL_ENABLE)
+                enabled = bool(it_enable is not None and it_enable.checkState() == QtCore.Qt.Checked)
+                arr = calc_data.get(cc)
+                val = float(arr[-1]) if (enabled and isinstance(arr, np.ndarray) and arr.size > 0) else 0.0
+                it_val = self.calcTable.item(r, CCOL_VALUE)
+                if it_val is not None:
+                    it_val.setText(f"{val:.6g}")
+                err = str(self._calc_compile_errors.get(cc, "") or self._calc_runtime_errors.get(cc, "") or "")
+                if err:
+                    self._set_calc_row_error(r, err)
+                else:
+                    self._clear_calc_row_error(r)
+        finally:
+            self._building_calc_table = False
 
     def _init_sync_agent(self):
         if ModuleSyncAgent is None:
@@ -1172,6 +1764,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             zeroItem.setFlags(zeroItem.flags() & ~QtCore.Qt.ItemIsEditable)
             self.table.setItem(i, COL_ZERO_VAL, zeroItem)
         self._building_table = False
+        self._schedule_embedded_widget_relayout()
 
     def _type_changed_for_row(self, row: int):
         phys = self.table.item(row, COL_PHYS).text().strip()
@@ -1228,16 +1821,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             try:
                 base = new_label
                 if base:
-                    # Raccogli tutte le etichette degli altri canali (case-insensitive)
-                    existing = []
-                    for r in range(self.table.rowCount()):
-                        if r == row:
-                            continue
-                        it_lbl = self.table.item(r, COL_LABEL)
-                        if it_lbl:
-                            txt = (it_lbl.text() or "").strip()
-                            if txt:
-                                existing.append(txt.lower())
+                    # Raccogli tutte le etichette degli altri canali (fisici + calcolati, case-insensitive)
+                    existing = self._existing_channel_names_lower(exclude_phys_row=row)
                     # Se il nuovo nome ? gi? presente, trova un suffisso libero
                     if base.lower() in existing:
                         suffix = 2
@@ -1390,6 +1975,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         self._update_rate_label(phys)
         self._push_sensor_map_to_core()
+        self._push_calculated_channels_to_core()
         self._sync_emit_status_update()
 
     def _update_rate_label(self, phys_list):
@@ -1487,6 +2073,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                             self._push_sensor_map_to_core()
                         except Exception:
                             pass
+                        try:
+                            self._push_calculated_channels_to_core()
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -1539,6 +2129,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # invia i nomi canale al core (per ogni riga della tabella)
         # send channel labels and configure base filename for TDMS segments
         self._push_channel_labels_to_core()
+        self._push_calculated_channels_to_core()
         # imposta il limite di memoria in base al valore selezionato nella spinbox
         try:
             mem_mb = self.spinRam.value()
@@ -1715,17 +2306,27 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def _reset_plots(self):
         self._chart_x.clear()
         for dq in self._chart_y_by_phys.values(): dq.clear()
+        for dq in self._chart_y_by_calc.values(): dq.clear()
         self._instant_t = np.array([], dtype=float)
         self._instant_y_by_phys = {k: np.array([], dtype=float) for k in self._instant_y_by_phys}
+        self._instant_y_by_calc = {k: np.array([], dtype=float) for k in self._instant_y_by_calc}
 
         for c in list(self._chart_curves_by_phys.values()):
+            try: self.pgChart.removeItem(c)
+            except Exception: pass
+        for c in list(self._chart_curves_by_calc.values()):
             try: self.pgChart.removeItem(c)
             except Exception: pass
         for c in list(self._instant_curves_by_phys.values()):
             try: self.pgInstant.removeItem(c)
             except Exception: pass
+        for c in list(self._instant_curves_by_calc.values()):
+            try: self.pgInstant.removeItem(c)
+            except Exception: pass
         self._chart_curves_by_phys.clear()
         self._instant_curves_by_phys.clear()
+        self._chart_curves_by_calc.clear()
+        self._instant_curves_by_calc.clear()
         self._chart_legend.clear()
         self._instant_legend.clear()
 
@@ -1767,6 +2368,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 pass
             self._instant_curves_by_phys[phys] = ic
             self._instant_legend.addItem(ic, label)
+        self._sync_calc_plot_curves()
 
     def _rebuild_legends(self):
         self._chart_legend.clear()
@@ -1785,11 +2387,38 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             try: curve.setName(label)
             except Exception: pass
             self._instant_legend.addItem(curve, label)
+        for cc, curve in self._chart_curves_by_calc.items():
+            r = self._find_calc_row_by_cc(cc)
+            label = cc
+            if r >= 0:
+                it = self.calcTable.item(r, CCOL_LABEL)
+                label = str((it.text() if it else cc) or cc).strip() or cc
+            try:
+                curve.setName(label)
+            except Exception:
+                pass
+            self._chart_legend.addItem(curve, label)
+        for cc, curve in self._instant_curves_by_calc.items():
+            r = self._find_calc_row_by_cc(cc)
+            label = cc
+            if r >= 0:
+                it = self.calcTable.item(r, CCOL_LABEL)
+                label = str((it.text() if it else cc) or cc).strip() or cc
+            try:
+                curve.setName(label)
+            except Exception:
+                pass
+            self._instant_legend.addItem(curve, label)
 
     def _clear_chart(self):
         self._chart_x.clear()
         for phys, curve in self._chart_curves_by_phys.items():
             self._chart_y_by_phys[phys].clear()
+            curve.clear()
+        for cc, curve in self._chart_curves_by_calc.items():
+            dq = self._chart_y_by_calc.get(cc)
+            if dq is not None:
+                dq.clear()
             curve.clear()
 
     # slot dai segnali (main thread)
@@ -1798,6 +2427,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self._instant_t = np.asarray(t, dtype=float)
             # mappa nome di start -> phys
             start_to_phys = {name: phys for phys, name in self._start_label_by_phys.items()}
+            phys_map: Dict[str, np.ndarray] = {}
             for name, y in zip(names, ys):
                 phys = start_to_phys.get(name)
                 if not phys: continue
@@ -1805,6 +2435,12 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 a = float(cal.get("a",1.0)); b = float(cal.get("b",0.0))
                 y_eng = a * np.asarray(y, dtype=float) + b
                 self._instant_y_by_phys[phys] = y_eng
+                phys_map[phys] = y_eng
+            calc_data = self._evaluate_calculated_block(phys_map)
+            for cc, arr in calc_data.items():
+                self._instant_y_by_calc[cc] = arr
+            self._update_calc_table_values(calc_data)
+            self._sync_calc_plot_curves()
         except RuntimeError:
             pass
 
@@ -1813,6 +2449,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             t_pts = np.asarray(t_pts, dtype=float)
             self._chart_x.extend(t_pts.tolist())
             start_to_phys = {name: phys for phys, name in self._start_label_by_phys.items()}
+            phys_map: Dict[str, np.ndarray] = {}
             for name, ypts in zip(names, ys_pts):
                 phys = start_to_phys.get(name)
                 if not phys: continue
@@ -1820,16 +2457,45 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 a = float(cal.get("a",1.0)); b = float(cal.get("b",0.0))
                 y_eng = a * np.asarray(ypts, dtype=float) + b
                 self._chart_y_by_phys[phys].extend(y_eng.tolist())
+                phys_map[phys] = y_eng
+            try:
+                dec_step = int(getattr(self.acq, "chart_decimation", 1) or 1)
+            except Exception:
+                dec_step = 1
+            if dec_step <= 0:
+                dec_step = 1
+            expected = int(t_pts.size)
+            for cc, arr in dict(self._instant_y_by_calc or {}).items():
+                a = np.asarray(arr, dtype=float).reshape(-1)
+                y_dec = a[::dec_step] if dec_step > 1 else a
+                if expected > 0:
+                    if y_dec.size > expected:
+                        y_dec = y_dec[:expected]
+                    elif y_dec.size < expected and y_dec.size > 0:
+                        y_dec = np.pad(y_dec, (0, expected - y_dec.size), mode="edge")
+                dq = self._chart_y_by_calc.get(cc)
+                if dq is None:
+                    dq = deque(maxlen=12000)
+                    self._chart_y_by_calc[cc] = dq
+                dq.extend(y_dec.tolist())
         except RuntimeError:
             pass
 
     def _refresh_plots(self):
+        self._sync_calc_plot_curves()
         # chart concatenato
         n = len(self._chart_x)
         if n > 1:
             x = np.fromiter(self._chart_x, dtype=float, count=n)
             for phys, curve in self._chart_curves_by_phys.items():
                 dq = self._chart_y_by_phys.get(phys)
+                if not dq:
+                    continue
+                y = np.fromiter(dq, dtype=float, count=len(dq))
+                if y.size == x.size and y.size > 1:
+                    curve.setData(x, y)
+            for cc, curve in self._chart_curves_by_calc.items():
+                dq = self._chart_y_by_calc.get(cc)
                 if not dq:
                     continue
                 y = np.fromiter(dq, dtype=float, count=len(dq))
@@ -1842,27 +2508,47 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 y = self._instant_y_by_phys.get(phys)
                 if isinstance(y, np.ndarray) and y.size == self._instant_t.size and y.size > 1:
                     curve.setData(self._instant_t, y)
+            for cc, curve in self._instant_curves_by_calc.items():
+                y = self._instant_y_by_calc.get(cc)
+                if isinstance(y, np.ndarray) and y.size == self._instant_t.size and y.size > 1:
+                    curve.setData(self._instant_t, y)
 
-        # Calcola il valore medio per ogni canale attivo e aggiorna l'etichetta
+        # Mostra media del blocco istantaneo per canali fisici + calcolati abilitati.
         try:
             if hasattr(self, 'lblAvgChart'):
                 avg_strings = []
-                # Usa l'ordine dei canali avviati per mantenere la coerenza
+                # Fisici attivi in ordine di start
                 for phys in self._current_phys_order:
-                    dq = self._chart_y_by_phys.get(phys)
-                    if dq and len(dq) > 0:
+                    y = self._instant_y_by_phys.get(phys)
+                    if isinstance(y, np.ndarray) and y.size > 0:
                         try:
-                            # Converte il deque in array per calcolare la media
-                            y_vals = np.fromiter(dq, dtype=float, count=len(dq))
-                            if y_vals.size > 0:
-                                avg_val = float(np.mean(y_vals))
-                                # Determina il nome da visualizzare (label al momento dello start) o fallback
-                                label = self._start_label_by_phys.get(phys, self._label_by_phys.get(phys, phys))
-                                unit = self._calib_by_phys.get(phys, {}).get('unit', '')
-                                avg_strings.append(f"{label}: {avg_val:.6g}" + (f" {unit}" if unit else ""))
+                            avg_val = float(np.mean(y))
+                            label = self._start_label_by_phys.get(phys, self._label_by_phys.get(phys, phys))
+                            unit = self._calib_by_phys.get(phys, {}).get('unit', '')
+                            avg_strings.append(f"{label}: {avg_val:.6g}" + (f" {unit}" if unit else ""))
                         except Exception:
                             pass
-                # Aggiorna il testo dell'etichetta con le medie separate da virgola
+                # Calcolati abilitati (locali modulo)
+                for r in range(self.calcTable.rowCount()):
+                    try:
+                        it_en = self.calcTable.item(r, CCOL_ENABLE)
+                        if it_en is None or it_en.checkState() != QtCore.Qt.Checked:
+                            continue
+                        cc = self._calc_channel_id_for_row(r)
+                        formula = str(self._calc_formula_by_cc.get(cc, "") or "").strip()
+                        if not formula:
+                            continue
+                        if cc in self._calc_compile_errors:
+                            continue
+                        y = self._instant_y_by_calc.get(cc)
+                        if not isinstance(y, np.ndarray) or y.size <= 0:
+                            continue
+                        avg_val = float(np.mean(y))
+                        it_label = self.calcTable.item(r, CCOL_LABEL)
+                        label = str((it_label.text() if it_label else cc) or cc).strip() or cc
+                        avg_strings.append(f"{label}: {avg_val:.6g}")
+                    except Exception:
+                        pass
                 self.lblAvgChart.setText(", ".join(avg_strings) if avg_strings else "")
         except Exception:
             pass
@@ -1930,7 +2616,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def _workspace_next_free_base(self, cfg, base):
         candidate = base
         idx = 2
-        while (f"{candidate}.general" in cfg) or (f"{candidate}.channels" in cfg):
+        while (f"{candidate}.general" in cfg) or (f"{candidate}.channels" in cfg) or (f"{candidate}.calculated_channels" in cfg):
             candidate = f"{base}_{idx}"
             idx += 1
         return candidate
@@ -1984,8 +2670,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         sec_general = f"{entry_base}.general"
         sec_channels = f"{entry_base}.channels"
+        sec_calc = f"{entry_base}.calculated_channels"
         cfg[sec_general] = {}
         cfg[sec_channels] = {}
+        cfg[sec_calc] = {}
 
         gen = cfg[sec_general]
         try:
@@ -2061,6 +2749,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         chsec["zero_raw"] = ",".join(zero_raw_list)
         chsec["zero_display"] = ",".join(zero_display_list)
 
+        calcsec = cfg[sec_calc]
+        calcsec["rows_json"] = json.dumps(self._calc_rows_payload())
+
         try:
             with open(path, "w", encoding="utf-8") as f:
                 cfg.write(f)
@@ -2099,12 +2790,14 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         sec_general = f"{entry_base}.general"
         sec_channels = f"{entry_base}.channels"
+        sec_calc = f"{entry_base}.calculated_channels"
         if sec_general not in cfg or sec_channels not in cfg:
             QtWidgets.QMessageBox.warning(self, "Attenzione", "Nessun workspace per la scheda corrente")
             return
 
         gen = cfg[sec_general]
         chsec = cfg[sec_channels]
+        calcsec = cfg[sec_calc] if sec_calc in cfg else None
 
         sensor_db = gen.get("sensor_db_path", "").strip()
         if sensor_db:
@@ -2236,6 +2929,50 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                         pass
         except Exception:
             pass
+        # calculated channels (retrocompatibile: sezione opzionale)
+        try:
+            if calcsec is not None:
+                rows_json = str(calcsec.get("rows_json", "") or "").strip()
+                rows = json.loads(rows_json) if rows_json else []
+                if isinstance(rows, list):
+                    self._building_calc_table = True
+                    try:
+                        self.calcTable.setRowCount(0)
+                        self._calc_formula_by_cc.clear()
+                        self._calc_zero_by_cc.clear()
+                        for idx, row_data in enumerate(rows[:MAX_CALCULATED_CHANNELS]):
+                            self._append_calc_row(idx)
+                            r = self.calcTable.rowCount() - 1
+                            cc = self._calc_channel_id_for_row(r)
+                            try:
+                                rid = str(row_data.get("channel_id", cc) or cc).strip()
+                            except Exception:
+                                rid = cc
+                            if rid != cc:
+                                self.calcTable.item(r, CCOL_ID).setText(rid)
+                                cc = rid
+                            formula = str(row_data.get("formula", "") or "")
+                            self._calc_formula_by_cc[cc] = formula
+                            self.calcTable.item(r, CCOL_FORMULA).setText(self._preview_formula_text(formula))
+                            self.calcTable.item(r, CCOL_FORMULA).setToolTip(formula)
+                            name = str(row_data.get("name", cc) or cc).strip() or cc
+                            self.calcTable.item(r, CCOL_LABEL).setText(name)
+                            en = bool(row_data.get("enabled", False))
+                            pv = bool(row_data.get("plot_enabled", False))
+                            self.calcTable.item(r, CCOL_ENABLE).setCheckState(QtCore.Qt.Checked if en else QtCore.Qt.Unchecked)
+                            self.calcTable.item(r, CCOL_PLOT).setCheckState(QtCore.Qt.Checked if pv else QtCore.Qt.Unchecked)
+                            z = row_data.get("zero", None)
+                            self._calc_zero_by_cc[cc] = float(z) if z is not None else None
+                            if z is not None:
+                                self.calcTable.item(r, CCOL_ZERO_VAL).setText(f"{float(z):.6g}")
+                    finally:
+                        self._building_calc_table = False
+        except Exception:
+            pass
+        if self.calcTable.rowCount() <= 0:
+            self._populate_calc_table(reset=True)
+        self._rebuild_calc_engine(update_core=True, test_runtime=True)
+        self._sync_calc_plot_curves()
         QtWidgets.QMessageBox.information(self, "Caricato", f"Workspace caricato:\n{fname}")
 
     # ----------------------------- Channel helpers per ResourceManager -----------------------------
@@ -2425,6 +3162,41 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
             # --- Valore istantaneo (display only; solo colore) ---
             self._set_row_bg(r, COL_VALUE, gray if lock else white)
+        self._set_calc_table_lock(lock)
+
+    def _set_calc_table_lock(self, lock: bool) -> None:
+        gray = QtGui.QColor("#e9ecef")
+        white = QtGui.QColor("#ffffff")
+        self.btnAddCalcChannel.setEnabled(not lock)
+        self.btnResetCalc.setEnabled(not lock)
+        self.chkCalcViewEnable.setEnabled(not lock)
+        nrows = self.calcTable.rowCount()
+        for r in range(nrows):
+            for col in (CCOL_ENABLE, CCOL_ID, CCOL_FORMULA, CCOL_LABEL, CCOL_VALUE, CCOL_ZERO_VAL, CCOL_PLOT):
+                it = self.calcTable.item(r, col)
+                if it is not None:
+                    it.setBackground(gray if lock else white)
+            it_en = self.calcTable.item(r, CCOL_ENABLE)
+            if it_en is not None:
+                if lock:
+                    it_en.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+                else:
+                    self._apply_calc_row_flags(r)
+            it_label = self.calcTable.item(r, CCOL_LABEL)
+            if it_label is not None:
+                if lock:
+                    it_label.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+                else:
+                    it_label.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsEditable)
+            it_plot = self.calcTable.item(r, CCOL_PLOT)
+            if it_plot is not None:
+                if lock:
+                    it_plot.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
+                else:
+                    it_plot.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable)
+            btn_zero = self.calcTable.cellWidget(r, CCOL_ZERO_BTN)
+            if isinstance(btn_zero, QtWidgets.QPushButton):
+                btn_zero.setEnabled(not lock)
 
     def _uncheck_all_enabled(self):
         """Rimuove tutte le spunte 'Abilita' (senza scatenare ricalcoli ripetuti)."""

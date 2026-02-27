@@ -3,6 +3,8 @@ import os, math, time, uuid, queue, threading, tempfile, datetime
 from typing import List, Callable, Optional, Dict, Any, Tuple
 import numpy as np
 
+from calculated_channels_engine import CalculatedChannelsEngine
+
 # --- NI-DAQmx ---------------------------------------------------------------
 _nidaqmx_import_error = None
 try:
@@ -74,6 +76,9 @@ class AcquisitionManager:
         # number of channels. If None, the automatic maximum is used.
         self._user_rate_hz: Optional[float] = None
         self._sensor_map_by_phys: Dict[str, Dict[str, Any]] = {}
+        self._calc_rows: List[Dict[str, Any]] = []
+        self._calc_compile_errors: Dict[str, str] = {}
+        self._calc_engine = CalculatedChannelsEngine(max_channels=30)
 
         # Registrazione TDMS
         self._recording_enabled = False
@@ -120,6 +125,51 @@ class AcquisitionManager:
 
     def set_sensor_map(self, sensor_map_by_phys: Dict[str, Dict[str, Any]]):
         self._sensor_map_by_phys = dict(sensor_map_by_phys or {})
+
+    def set_calculated_channels(self, rows: List[Dict[str, Any]]) -> Dict[str, str]:
+        norm_rows: List[Dict[str, Any]] = []
+        formula_map: Dict[str, str] = {}
+        for row in list(rows or [])[:30]:
+            try:
+                cc = str(row.get("channel_id", "") or "").strip()
+            except Exception:
+                cc = ""
+            if not cc.startswith("cc"):
+                continue
+            formula = str(row.get("formula", "") or "").strip()
+            name = str(row.get("name", cc) or cc).strip() or cc
+            try:
+                zero = row.get("zero", None)
+                zero = float(zero) if zero is not None else None
+            except Exception:
+                zero = None
+            norm_rows.append(
+                {
+                    "channel_id": cc,
+                    "formula": formula,
+                    "enabled": bool(row.get("enabled", False)),
+                    "plot_enabled": bool(row.get("plot_enabled", False)),
+                    "name": name,
+                    "zero": zero,
+                }
+            )
+            formula_map[cc] = formula
+        self._calc_compile_errors = self._calc_engine.configure(formula_map)
+        for row in norm_rows:
+            cc = row.get("channel_id", "")
+            if cc in self._calc_compile_errors:
+                row["enabled"] = False
+        try:
+            enabled_ids = [
+                str(r.get("channel_id", "") or "").strip()
+                for r in norm_rows
+                if bool(r.get("enabled", False)) and str(r.get("formula", "") or "").strip()
+            ]
+            self._calc_engine.set_enabled_channels(enabled_ids)
+        except Exception:
+            pass
+        self._calc_rows = norm_rows
+        return dict(self._calc_compile_errors)
 
     @property
     def recording_enabled(self) -> bool:
@@ -824,6 +874,28 @@ class AcquisitionManager:
                                 used.add(name)
                     except Exception:
                         pass
+                    calc_rows_enabled: List[Dict[str, Any]] = []
+                    calc_tdms_name_by_cc: Dict[str, str] = {}
+                    all_data_channel_names = list(tdms_names)
+                    try:
+                        calc_rows_enabled = [
+                            dict(r) for r in list(self._calc_rows or [])
+                            if bool(r.get("enabled", False))
+                        ]
+                        if calc_rows_enabled:
+                            raw_calc_names = [
+                                str(r.get("name", r.get("channel_id", "calculated")) or r.get("channel_id", "calculated"))
+                                for r in calc_rows_enabled
+                            ]
+                            combined = self._unique_tdms_names(all_data_channel_names + raw_calc_names)
+                            calc_names = combined[len(all_data_channel_names):]
+                            all_data_channel_names = combined
+                            for row, nm in zip(calc_rows_enabled, calc_names):
+                                calc_tdms_name_by_cc[str(row.get("channel_id", ""))] = str(nm)
+                    except Exception:
+                        calc_rows_enabled = []
+                        calc_tdms_name_by_cc = {}
+                        all_data_channel_names = list(tdms_names)
                     # Precompute ISO timestamp for the segment
                     seg_iso = datetime.datetime.fromtimestamp(start_time_epoch_s).isoformat()
                     # Loop through blocks and write them
@@ -857,7 +929,7 @@ class AcquisitionManager:
                         try:
                             root = RootObject(properties={
                                 "sample_rate": fs,
-                                "channels": ",".join(tdms_names),
+                                "channels": ",".join(all_data_channel_names),
                                 "start_index": int(seg_start_idx),
                                 "chunk_offset": int(start_in_file),
                                 "start_time_epoch_s": float(start_time_epoch_s),
@@ -896,6 +968,7 @@ class AcquisitionManager:
                         # Data channels
                         try:
                             num_ch = min(len(tdms_names), buf.shape[0])
+                            phys_data_eng_by_name: Dict[str, np.ndarray] = {}
                             for i in range(num_ch):
                                 ui_name = tdms_names[i]
                                 try:
@@ -935,9 +1008,51 @@ class AcquisitionManager:
                                         "zero_applied": float(zero_eng),
                                     }
                                     channels.append(ChannelObject("Acquisition", ui_name, data_eng, properties=props))
+                                    phys_data_eng_by_name[phys] = np.asarray(data_eng, dtype=np.float64)
                                 except Exception as e:
                                     # Skip problematic channel but continue writing others
                                     print(f"Writer warning (data channel {i}):", e)
+                            if calc_rows_enabled:
+                                try:
+                                    calc_out, calc_err = self._calc_engine.evaluate(phys_data_eng_by_name, fs, fill_value=0.0)
+                                except Exception as e:
+                                    calc_out, calc_err = {}, {"__all__": str(e)}
+                                for row in calc_rows_enabled:
+                                    cc = str(row.get("channel_id", "") or "").strip()
+                                    if not cc:
+                                        continue
+                                    calc_name = calc_tdms_name_by_cc.get(cc, cc)
+                                    arr = calc_out.get(cc)
+                                    if not isinstance(arr, np.ndarray):
+                                        arr = np.zeros(n, dtype=np.float64)
+                                    else:
+                                        arr = np.asarray(arr, dtype=np.float64).reshape(-1)
+                                        if arr.size > n:
+                                            arr = arr[:n]
+                                        elif arr.size < n and arr.size > 0:
+                                            arr = np.pad(arr, (0, n - arr.size), mode="edge")
+                                        elif arr.size <= 0:
+                                            arr = np.zeros(n, dtype=np.float64)
+                                    z = row.get("zero", None)
+                                    if z is not None:
+                                        try:
+                                            arr = arr - float(z)
+                                        except Exception:
+                                            pass
+                                    props = {
+                                        "Description": "Calculated channel",
+                                        "description": "Calculated channel",
+                                        "Unit": "",
+                                        "unit_string": "",
+                                        "wf_start_time": datetime.datetime.fromtimestamp(start_time_epoch_s),
+                                        "wf_increment": 1.0 / fs,
+                                        "calculated_channel_id": cc,
+                                        "formula": str(row.get("formula", "") or ""),
+                                        "runtime_error": str(calc_err.get(cc, "") or ""),
+                                    }
+                                    channels.append(
+                                        ChannelObject("Acquisition", calc_name, np.ascontiguousarray(arr, dtype=np.float64), properties=props)
+                                    )
                         except Exception as e:
                             print("Writer error (data channels build):", e)
                         # Write the mini‑segment
