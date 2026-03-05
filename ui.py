@@ -40,7 +40,7 @@ COL_ENABLE   = 0
 COL_PHYS     = 1
 COL_TYPE     = 2   # Tipo risorsa (Voltage o sensori dal DB)
 COL_LABEL    = 3   # Nome canale (etichetta utente)
-COL_VALUE    = 4   # Valore istantaneo (con unit? se selezionata)
+COL_VALUE    = 4   # Valore istantaneo (con unitase selezionata)
 COL_ZERO_BTN = 5
 COL_ZERO_VAL = 6
 
@@ -96,7 +96,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # mappature canali
         self._current_phys_order = []                    # ordine fisico corrente avviato
-        self._label_by_phys = {f"ai{i}": f"ai{i}" for i in range(8)}   # label utente "Nome canaleâ€
+        self._label_by_phys = {f"ai{i}": f"ai{i}" for i in range(8)}   # label utente "Nome canale"
         self._sensor_type_by_phys = {f"ai{i}": "Voltage" for i in range(8)}
         self._calib_by_phys = {f"ai{i}": {"unit":"", "a":1.0, "b":0.0} for i in range(8)}
         self._start_label_by_phys = {}                   # mapping phys -> nome al momento dello start
@@ -302,7 +302,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.spinRam.setValue(500)
         self.spinRam.setSuffix(" MB")
         self.spinRam.setSingleStep(50)
-        self.btnStart = QtWidgets.QPushButton("Salva dati")            # passa a "Salvo in (xx s)?â€
+        self.btnStart = QtWidgets.QPushButton("Salva dati")            # passa a "Salvo in (xx s)?"
         self.btnStop = QtWidgets.QPushButton("Stop e ricomponi...")
         self.btnStop.setEnabled(False)
 
@@ -1824,7 +1824,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             # Etichetta digitata dall'utente (fallback al nome fisico se vuota)
             new_label = (item.text() or "").strip() or phys
 
-            # Deduplica il nuovo nome rispetto agli altri canali.  Se esiste gi? un
+            # Deduplica il nuovo nome rispetto agli altri canali.  Se esiste giaun
             # altro canale con la stessa etichetta (ignorando la differenza
             # maiuscole/minuscole), appende un suffisso _2, _3, ... fino a trovare
             # un nome non in uso.  Questa logica evita ambiguit? quando i nomi
@@ -1834,7 +1834,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 if base:
                     # Raccogli tutte le etichette degli altri canali (fisici + calcolati, case-insensitive)
                     existing = self._existing_channel_names_lower(exclude_phys_row=row)
-                    # Se il nuovo nome ? gi? presente, trova un suffisso libero
+                    # Se il nuovo nome ? giapresente, trova un suffisso libero
                     if base.lower() in existing:
                         suffix = 2
                         candidate = f"{base}_{suffix}"
@@ -1999,7 +1999,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.lblRateInfo.setText(
                 f"Canali: {', '.join(labels)}  |  "
                 f"Rate per-canale {cur_per:.1f} kS/s  (agg: {cur_agg:.1f} kS/s)  |  "
-                f"Limiti modulo â†’ single {lim_single:.1f} kS/s, aggregato {lim_multi:.1f} kS/s"
+                f"Limiti modulo -> single {lim_single:.1f} kS/s, aggregato {lim_multi:.1f} kS/s"
             )
         except Exception:
             self.lblRateInfo.setText("-")
@@ -3091,7 +3091,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def _on_zero_button_clicked(self, phys: str):
         """
         Azzeramento canale:
-        - Legge il valore istantaneo ATTUALE (in unit? ingegneristiche)
+        - Legge il valore istantaneo ATTUALE (in unitaingegneristiche)
         - Lo mostra in colonna 'Valore azzerato'
         - Fissa lo zero nel core come valore RAW (Volt) dell'istante
         """
@@ -3100,13 +3100,13 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         if r < 0:
             return
 
-        # 1) valore istantaneo in unit? ingegneristiche (quello che vedi in UI)
+        # 1) valore istantaneo in unitaingegneristiche (quello che vedi in UI)
         try:
             val_eng = self.acq.get_last_engineered(phys)
         except Exception:
             val_eng = None
 
-        # unit? per visualizzazione
+        # unitaper visualizzazione
         unit = self._calib_by_phys.get(phys, {}).get("unit", "")
         if val_eng is not None:
             txt = f"{val_eng:.6g}" + (f" {unit}" if unit else "")
