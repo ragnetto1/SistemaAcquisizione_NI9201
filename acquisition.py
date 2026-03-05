@@ -513,19 +513,43 @@ class AcquisitionManager:
                     f"{device_name}/{ch}", min_val=-10.0, max_val=10.0
                 )
 
-            timing_prealloc = self.callback_chunk * 20
-            self._task.timing.cfg_samp_clk_timing(
-                rate=per_chan,
-                sample_mode=nidaqmx.constants.AcquisitionType.CONTINUOUS,
-                samps_per_chan=timing_prealloc
-            )
-            self._task.in_stream.input_buf_size = daq_buf_samps
-
-            # Optional hardware start synchronization across modules in the same chassis.
             sync_cfg = dict(sync_start_cfg or {})
             sync_mode = str(sync_cfg.get("sync_mode", "") or "").strip().lower()
             sync_role = str(sync_cfg.get("sync_role", "") or "").strip().lower()
             trig_src = str(sync_cfg.get("start_trigger_source", "") or "").strip()
+            sample_clk_mode = str(sync_cfg.get("sample_clock_mode", "") or "").strip().lower()
+            sample_clk_src = str(sync_cfg.get("sample_clock_source", "") or "").strip()
+            sample_clk_edge = str(sync_cfg.get("sample_clock_edge", "rising") or "rising").strip().lower()
+            use_shared_sample_clk = bool(
+                sync_mode == "hardware"
+                and sync_role == "slave"
+                and sample_clk_src
+                and sample_clk_mode in ("", "shared", "chassis", "external", "hardware", "auto")
+            )
+
+            timing_prealloc = self.callback_chunk * 20
+            timing_kwargs = {
+                "rate": float(per_chan),
+                "sample_mode": nidaqmx.constants.AcquisitionType.CONTINUOUS,
+                "samps_per_chan": int(timing_prealloc),
+            }
+            if use_shared_sample_clk:
+                edge = nidaqmx.constants.Edge.FALLING if sample_clk_edge == "falling" else nidaqmx.constants.Edge.RISING
+                timing_kwargs["source"] = sample_clk_src
+                timing_kwargs["active_edge"] = edge
+            try:
+                self._task.timing.cfg_samp_clk_timing(**timing_kwargs)
+            except Exception as exc:
+                if use_shared_sample_clk:
+                    print(f"Warning NI9201: sample clock condiviso non disponibile ({sample_clk_src}); fallback locale. Dettaglio: {exc}")
+                    timing_kwargs.pop("source", None)
+                    timing_kwargs.pop("active_edge", None)
+                    self._task.timing.cfg_samp_clk_timing(**timing_kwargs)
+                else:
+                    raise
+            self._task.in_stream.input_buf_size = daq_buf_samps
+
+            # Optional hardware start synchronization across modules in the same chassis.
             if sync_mode == "hardware" and sync_role == "slave":
                 if not trig_src:
                     raise RuntimeError("Trigger source hardware non valido.")

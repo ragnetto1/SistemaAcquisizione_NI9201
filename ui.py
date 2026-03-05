@@ -1259,11 +1259,22 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         mode = str(payload.get("mode", "software") or "software").strip().lower()
         sync_role = str(payload.get("sync_role", "") or "").strip().lower()
         trig_src = str(payload.get("start_trigger_source", "") or "").strip()
+        sample_clk_mode = str(payload.get("sample_clock_mode", "") or "").strip().lower()
+        sample_clk_src = str(payload.get("sample_clock_source", "") or "").strip()
+        sample_clk_edge = str(payload.get("sample_clock_edge", "rising") or "rising").strip().lower()
+        try:
+            sample_clk_rate = float(payload.get("sample_clock_rate_hz", 0.0) or 0.0)
+        except Exception:
+            sample_clk_rate = 0.0
         if mode == "hardware":
             self._pending_sync_start_cfg = {
                 "sync_mode": "hardware",
                 "sync_role": sync_role,
                 "start_trigger_source": trig_src,
+                "sample_clock_mode": sample_clk_mode,
+                "sample_clock_source": sample_clk_src,
+                "sample_clock_edge": sample_clk_edge,
+                "sample_clock_rate_hz": sample_clk_rate,
             }
         else:
             self._pending_sync_start_cfg = None
