@@ -61,24 +61,74 @@ class ImportStartupUI:
     def _build_ui(self) -> None:
         self._window = QtWidgets.QWidget()
         self._window.setWindowTitle("Avvio e import moduli")
-        self._window.setFixedSize(560, 170)
+        self._window.setFixedSize(620, 210)
+        self._window.setObjectName("startupRoot")
+        self._window.setStyleSheet(
+            """
+            #startupRoot {
+                background: #f4f6fa;
+                color: #111827;
+            }
+            #startupCard {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 10px;
+            }
+            QLabel {
+                background: transparent;
+                color: #111827;
+            }
+            QLabel#startupTitle {
+                font-size: 21px;
+                font-weight: 700;
+                color: #1e3a8a;
+            }
+            QLabel#startupStatus {
+                font-size: 14px;
+                font-weight: 600;
+                color: #1f2937;
+            }
+            QLabel#startupDetail {
+                font-family: Consolas, 'Courier New', monospace;
+                font-size: 13px;
+                color: #0f172a;
+            }
+            QLabel#startupPercent {
+                font-size: 13px;
+                font-weight: 700;
+                color: #1e3a8a;
+            }
+            QProgressBar {
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                background: #f8fafc;
+                min-height: 18px;
+            }
+            QProgressBar::chunk {
+                background: #22c55e;
+                border-radius: 5px;
+            }
+            """
+        )
 
         main = QtWidgets.QVBoxLayout(self._window)
         main.setContentsMargins(12, 12, 12, 12)
-        main.setSpacing(8)
+        main.setSpacing(10)
+
+        card = QtWidgets.QFrame()
+        card.setObjectName("startupCard")
+        card_layout = QtWidgets.QVBoxLayout(card)
+        card_layout.setContentsMargins(14, 14, 14, 14)
+        card_layout.setSpacing(10)
+        main.addWidget(card)
 
         self._lbl_title = QtWidgets.QLabel("SistemaAcquisizione_NI9201")
-        f_title = self._lbl_title.font()
-        f_title.setPointSize(11)
-        f_title.setBold(True)
-        self._lbl_title.setFont(f_title)
-        main.addWidget(self._lbl_title)
+        self._lbl_title.setObjectName("startupTitle")
+        card_layout.addWidget(self._lbl_title)
 
         self._lbl_status = QtWidgets.QLabel("Preparazione import...")
-        f_status = self._lbl_status.font()
-        f_status.setPointSize(10)
-        self._lbl_status.setFont(f_status)
-        main.addWidget(self._lbl_status)
+        self._lbl_status.setObjectName("startupStatus")
+        card_layout.addWidget(self._lbl_status)
 
         bar_row = QtWidgets.QHBoxLayout()
         self._bar = QtWidgets.QProgressBar()
@@ -88,17 +138,15 @@ class ImportStartupUI:
         bar_row.addWidget(self._bar, 1)
 
         self._lbl_percent = QtWidgets.QLabel("0%")
+        self._lbl_percent.setObjectName("startupPercent")
         self._lbl_percent.setFixedWidth(40)
         self._lbl_percent.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         bar_row.addWidget(self._lbl_percent)
-        main.addLayout(bar_row)
+        card_layout.addLayout(bar_row)
 
         self._lbl_detail = QtWidgets.QLabel("In attesa...")
-        f_detail = self._lbl_detail.font()
-        f_detail.setFamily("Consolas")
-        f_detail.setPointSize(10)
-        self._lbl_detail.setFont(f_detail)
-        main.addWidget(self._lbl_detail)
+        self._lbl_detail.setObjectName("startupDetail")
+        card_layout.addWidget(self._lbl_detail)
 
     def _setup_worker(self) -> None:
         self._thread = QtCore.QThread(self._window)

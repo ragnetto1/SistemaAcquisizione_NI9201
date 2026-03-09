@@ -18,7 +18,6 @@ def main():
     from PyQt5 import QtWidgets
     from acquisition import AcquisitionManager
     from tdms_merge import TdmsMerger
-    from ui import AcquisitionWindow
 
     app = QtWidgets.QApplication.instance()
     created_app = False
@@ -29,13 +28,90 @@ def main():
     # In questa versione l'applicazione e progettata esclusivamente per la NI-9201.
     # Non viene richiesto all'utente di selezionare il modello della scheda.
     acq_manager = AcquisitionManager()
-    window = AcquisitionWindow(acq_manager=acq_manager, merger=TdmsMerger())
+    WindowCls = _resolve_window_class(acq_manager, default_digits="9201")
+    window = WindowCls(acq_manager=acq_manager, merger=TdmsMerger())
     window.show()
 
     exit_code = app.exec_()
     if created_app:
         sys.exit(exit_code)
     return exit_code
+
+
+def _has_physical_device(acq_manager, default_digits: str) -> bool:
+    digits = str(default_digits or "").strip()
+    try:
+        board = str(getattr(acq_manager, "board_type", "") or "")
+        only_digits = "".join(ch for ch in board if ch.isdigit())
+        if only_digits:
+            digits = only_digits
+    except Exception:
+        pass
+
+    methods = ["list_current_devices_meta"]
+    if digits:
+        methods.extend([f"list_ni{digits}_devices_meta", f"list_ni{digits}_devices"])
+
+    board_keys = set()
+    if digits:
+        board_keys.add(f"NI{digits}")
+    try:
+        board_keys.add(str(getattr(acq_manager, "board_type", "") or "").upper().replace(" ", ""))
+    except Exception:
+        pass
+    board_keys = {k for k in board_keys if k}
+
+    def _matches_board(item: dict) -> bool:
+        ptype = str(item.get("product_type", "") or "").upper().replace(" ", "")
+        if not ptype:
+            return True
+        return any(k in ptype for k in board_keys)
+
+    for meth in methods:
+        fn = getattr(acq_manager, meth, None)
+        if not callable(fn):
+            continue
+        try:
+            out = list(fn() or [])
+        except Exception:
+            continue
+        if not out:
+            continue
+        first = out[0]
+        if isinstance(first, dict):
+            matched_any = False
+            unknown_state_found = False
+            for item in out:
+                if not isinstance(item, dict):
+                    continue
+                if not _matches_board(item):
+                    continue
+                matched_any = True
+                sim = item.get("is_simulated", None)
+                if sim is False:
+                    return True
+                if sim is None:
+                    unknown_state_found = True
+            if matched_any and unknown_state_found:
+                return True
+            continue
+        return True
+    return False
+
+
+def _resolve_window_class(acq_manager, default_digits: str):
+    use_color_ui = _has_physical_device(acq_manager, default_digits=default_digits)
+    module_name = "color_ui" if use_color_ui else "ui"
+    try:
+        mod = __import__(module_name, fromlist=["AcquisitionWindow"])
+        cls = getattr(mod, "AcquisitionWindow", None)
+        if cls is not None:
+            return cls
+    except Exception:
+        pass
+    from ui import AcquisitionWindow
+
+    return AcquisitionWindow
 
 
 def _extract_missing_module_name(exc: BaseException) -> str:

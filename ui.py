@@ -86,7 +86,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.acq = acq_manager
         self.merger = merger
 
-        self.setWindowTitle("NI 9201 Acquisition - Demo Architettura")
+        self.setWindowTitle("NI 9201 Acquisition - Architettura")
         self.resize(1200, 740)
 
         # stati UI/logica
