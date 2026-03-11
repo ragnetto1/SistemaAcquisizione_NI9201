@@ -142,6 +142,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._default_gui_interval = 100
         # Track if we are in stall mode to avoid repeated adjustments
         self._stall_active = False
+        # Ordered shutdown guard/state.
+        self._shutdown_in_progress = False
+        self._shutdown_phase = "idle"
 
         # Path for the current sensor database. Default to SENSOR_DB_DEFAULT.
         self._sensor_db_path = SENSOR_DB_DEFAULT
@@ -3037,43 +3040,80 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._auto_change = False
 
     # ----------------------------- Chiusura ordinata -----------------------------
-    def closeEvent(self, event: QtGui.QCloseEvent):
+    def _deactivate_all_channels_for_shutdown(self) -> None:
+        old_auto = bool(getattr(self, "_auto_change", False))
+        old_block = False
         try:
-            self._save_config()
-        except BaseException:
+            old_block = bool(self.table.blockSignals(True))
+        except Exception:
+            old_block = False
+        self._auto_change = True
+        try:
+            for r in range(self.table.rowCount()):
+                it_en = self.table.item(r, COL_ENABLE)
+                if it_en and it_en.checkState() == QtCore.Qt.Checked:
+                    it_en.setCheckState(QtCore.Qt.Unchecked)
+                it_val = self.table.item(r, COL_VALUE)
+                if it_val is None:
+                    it_val = QtWidgets.QTableWidgetItem("-")
+                    self.table.setItem(r, COL_VALUE, it_val)
+                it_val.setText("-")
+            self._last_enabled_phys = []
+            self._current_phys_order = []
+            self._start_label_by_phys = {}
+        finally:
+            self._auto_change = old_auto
+            try:
+                self.table.blockSignals(old_block)
+            except Exception:
+                pass
+
+    def _detach_acquisition_callbacks(self) -> None:
+        try:
+            self.acq.on_channel_value = None
+        except Exception:
             pass
+        try:
+            self.acq.on_new_instant_block = None
+        except Exception:
+            pass
+        try:
+            self.acq.on_new_chart_points = None
+        except Exception:
+            pass
+
+    def _stop_periodic_timers_for_shutdown(self) -> None:
+        for tname in ("guiTimer", "_count_timer", "_backlog_timer"):
+            try:
+                t = getattr(self, tname, None)
+                if t is not None and t.isActive():
+                    t.stop()
+            except Exception:
+                pass
+
+    def _close_sync_agent_for_shutdown(self) -> None:
         try:
             if self._sync_agent is not None:
                 self._sync_agent.close()
                 self._sync_agent = None
         except BaseException:
             pass
-        # stop timer UI
-        try:
-            if self.guiTimer.isActive():
-                self.guiTimer.stop()
-        except BaseException:
-            pass
-        try:
-            if hasattr(self, "_count_timer") and self._count_timer.isActive():
-                self._count_timer.stop()
-        except BaseException:
-            pass
-        try:
-            if hasattr(self, "_backlog_timer") and self._backlog_timer.isActive():
-                self._backlog_timer.stop()
-        except BaseException:
-            pass
-        # ferma core
+
+    def _shutdown_core_for_close(self) -> None:
         try:
             self.acq.set_recording(False)
+        except BaseException:
+            pass
+        try:
+            self.acq.stop_graceful()
         except BaseException:
             pass
         try:
             self.acq.stop()
         except BaseException:
             pass
-        # disconnetti segnali
+
+    def _disconnect_ui_signals_for_shutdown(self) -> None:
         try:
             self.sigInstantBlock.disconnect()
         except BaseException:
@@ -3086,6 +3126,30 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.channelValueUpdated.disconnect()
         except BaseException:
             pass
+
+    def _run_shutdown_state_machine(self) -> None:
+        if bool(getattr(self, "_shutdown_in_progress", False)):
+            return
+        self._shutdown_in_progress = True
+        phases = [
+            ("deactivate_channels", self._deactivate_all_channels_for_shutdown),
+            ("detach_callbacks", self._detach_acquisition_callbacks),
+            ("stop_timers", self._stop_periodic_timers_for_shutdown),
+            ("save_config", self._save_config),
+            ("close_sync_agent", self._close_sync_agent_for_shutdown),
+            ("stop_core", self._shutdown_core_for_close),
+            ("disconnect_signals", self._disconnect_ui_signals_for_shutdown),
+        ]
+        for name, fn in phases:
+            self._shutdown_phase = name
+            try:
+                fn()
+            except BaseException:
+                pass
+        self._shutdown_phase = "done"
+
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        self._run_shutdown_state_machine()
         super().closeEvent(event)
 
     def _on_zero_button_clicked(self, phys: str):

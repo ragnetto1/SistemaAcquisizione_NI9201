@@ -102,7 +102,16 @@ class AcquisitionWindow(_BaseAcquisitionWindow):
         self.setStyleSheet(_CDAQ_THEME)
 
         soft = "QPushButton {background:#e2e8f0; border:1px solid #94a3b8;} QPushButton:hover {background:#dbeafe;}"
-        accent = "QPushButton {background:#d1fae5; border:1px solid #6ee7b7;} QPushButton:hover {background:#a7f3d0;}"
+        accent = (
+            "QPushButton {background:#d1fae5; border:1px solid #6ee7b7;}"
+            " QPushButton:hover {background:#a7f3d0;}"
+            " QPushButton:disabled {"
+            " background:#d8f3e4;"
+            " color:#1f5134;"
+            " border:1px solid #9bcfb3;"
+            " font-weight:700;"
+            "}"
+        )
         danger = "QPushButton {background:#fee2e2; border:1px solid #fca5a5;} QPushButton:hover {background:#fecaca;}"
 
         for name in ("btnRefresh", "btnDefineTypes", "btnSaveWorkspace", "btnLoadWorkspace", "btnMerge", "btnViewTDMS"):
@@ -119,3 +128,6 @@ class AcquisitionWindow(_BaseAcquisitionWindow):
             btn = getattr(self, name, None)
             if isinstance(btn, QtWidgets.QPushButton):
                 btn.setStyleSheet(danger)
+
+    def closeEvent(self, event):  # type: ignore[override]
+        super().closeEvent(event)

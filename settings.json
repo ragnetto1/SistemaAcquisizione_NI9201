@@ -1,6 +1,6 @@
 {
-  "save_dir": "C:\\UG-WORK\\SistemaAcquisizione_CDAQ\\SenzaNome2_11-03-2026_09-10-23\\NI9201_cDAQ1Mod2",
-  "base_filename": "SenzaNome2.tdms",
-  "ram_mb": 12,
-  "fs": 100.0
+  "save_dir": "C:\\UG-WORK\\SistemaAcquisizione_NI9201",
+  "base_filename": "baue.tdms",
+  "ram_mb": 10,
+  "fs": 1125.0
 }
