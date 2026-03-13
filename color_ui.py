@@ -1,8 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from PyQt5 import QtWidgets
 
-from ui import AcquisitionWindow as _BaseAcquisitionWindow
+try:
+    from .ui import AcquisitionWindow as _BaseAcquisitionWindow
+except Exception:
+    from ui import AcquisitionWindow as _BaseAcquisitionWindow
 
 
 _CDAQ_THEME = """
@@ -131,3 +134,4 @@ class AcquisitionWindow(_BaseAcquisitionWindow):
 
     def closeEvent(self, event):  # type: ignore[override]
         super().closeEvent(event)
+

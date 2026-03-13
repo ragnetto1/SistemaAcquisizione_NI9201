@@ -1,6 +1,14 @@
 {
-  "save_dir": "C:\\UG-WORK\\SistemaAcquisizione_CDAQ\\Desync_12-03-2026_10-32-30\\NI9201_cDAQ2Mod1",
-  "base_filename": "Desync.tdms",
-  "ram_mb": 12,
-  "fs": 12500.0
+  "save_dir": "C:\\UG-WORK\\SistemaAcquisizione_NI9201",
+  "base_filename": "baue.tdms",
+  "ram_mb": 75,
+  "show_phys_plot": false,
+  "show_calc_plot": false,
+  "chart_preset": "Operativo",
+  "chart_mode": "Overlay",
+  "chart_window_s": 60.0,
+  "chart_robust_y": true,
+  "chart_lock_y": false,
+  "chart_cursors": false,
+  "fs": 1125.0
 }
