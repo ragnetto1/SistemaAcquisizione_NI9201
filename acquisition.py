@@ -48,6 +48,7 @@ class AcquisitionManager:
         self.current_agg_rate_hz: Optional[float] = None
         self.max_single_rate_hz: Optional[float] = None
         self.max_multi_rate_hz: Optional[float] = None
+        self._active_device_name: str = ""
 
         self._start_channel_names: List[str] = []
 
@@ -122,6 +123,22 @@ class AcquisitionManager:
             return
         self.temp_dir = os.path.abspath(path)
         os.makedirs(self.temp_dir, exist_ok=True)
+
+    @staticmethod
+    def _sanitize_tdms_component(text: str) -> str:
+        value = str(text or "").strip()
+        out = []
+        for ch in value:
+            if ch.isalnum() or ch in ("_", "-"):
+                out.append(ch)
+            else:
+                out.append("_")
+        clean = "".join(out).strip("._")
+        return clean or "device"
+
+    def _tdms_group_name(self) -> str:
+        device = self._sanitize_tdms_component(self._active_device_name or "device")
+        return f"Acquisition_NI9201_{device}"
 
     def set_sensor_map(self, sensor_map_by_phys: Dict[str, Dict[str, Any]]):
         self._sensor_map_by_phys = dict(sensor_map_by_phys or {})
@@ -454,6 +471,7 @@ class AcquisitionManager:
         self._ai_channels = ai_channels[:]
         self._channel_names = channel_names[:]
         self._start_channel_names = channel_names[:]
+        self._active_device_name = str(device_name or "")
 
         try:
             # --- rate per-canale (rispetta i limiti del dispositivo e canali) ---
@@ -517,6 +535,7 @@ class AcquisitionManager:
             sync_mode = str(sync_cfg.get("sync_mode", "") or "").strip().lower()
             sync_role = str(sync_cfg.get("sync_role", "") or "").strip().lower()
             trig_src = str(sync_cfg.get("start_trigger_source", "") or "").strip()
+            master_timebase_src = str(sync_cfg.get("master_timebase_source", "") or "").strip()
             sample_clk_mode = str(sync_cfg.get("sample_clock_mode", "") or "").strip().lower()
             sample_clk_src = str(sync_cfg.get("sample_clock_source", "") or "").strip()
             sample_clk_edge = str(sync_cfg.get("sample_clock_edge", "rising") or "rising").strip().lower()
@@ -526,6 +545,12 @@ class AcquisitionManager:
                 and sample_clk_src
                 and sample_clk_mode in ("", "shared", "chassis", "external", "hardware", "auto")
             )
+
+            if sync_mode == "hardware" and master_timebase_src:
+                try:
+                    self._task.timing.master_timebase_src = master_timebase_src
+                except Exception as exc:
+                    print(f"Warning NI9201: master timebase condivisa non disponibile ({master_timebase_src}). Dettaglio: {exc}")
 
             timing_prealloc = self.callback_chunk * 20
             timing_kwargs = {
@@ -572,6 +597,13 @@ class AcquisitionManager:
             # --- start acquisizione ---
             self._running = True
             self._task.start()
+            try:
+                actual_rate = float(self._task.timing.samp_clk_rate)
+                if actual_rate > 0:
+                    self.current_rate_hz = actual_rate
+                    self.current_agg_rate_hz = actual_rate * max(1, len(self._ai_channels))
+            except Exception:
+                pass
 
             # --- decimazione per grafico ---
             self._chart_decim = max(1, int(self.current_rate_hz // 50))
@@ -824,9 +856,6 @@ class AcquisitionManager:
         TDMS file. This approach guarantees that no samples are lost while
         providing larger segment files instead of the time‑based rotation.
         """
-        # Sample rate for time calculations
-        fs = float(self.current_rate_hz or 1.0)
-
         # Helper to flush accumulated blocks to disk
         def flush_memory():
             """
@@ -837,11 +866,11 @@ class AcquisitionManager:
             has been removed (e.g. after merging) or is unset, no file is
             written and the accumulated blocks are simply discarded.
             """
-            nonlocal fs
             # Nothing to flush
             if not self._memory_blocks:
                 return
             try:
+                fs = float(self.current_rate_hz or 1.0)
                 # If temp_dir is not set or no longer exists, discard accumulated data
                 if not self.temp_dir or not os.path.isdir(self.temp_dir):
                     # Clear memory without writing
@@ -964,7 +993,8 @@ class AcquisitionManager:
                                 "wf_start_time": datetime.datetime.fromtimestamp(start_time_epoch_s),
                                 "wf_increment": 1.0 / fs,
                             })
-                            group = GroupObject("Acquisition")
+                            group_name = self._tdms_group_name()
+                            group = GroupObject(group_name)
                         except Exception:
                             continue
                         # Channels: build Time channel
@@ -985,7 +1015,7 @@ class AcquisitionManager:
                                 "stored_domain": "time",
                             }
                             channels.append(ChannelObject(
-                                "Acquisition", "Time", t_rel, properties=time_props
+                                group_name, "Time", t_rel, properties=time_props
                             ))
                         except Exception:
                             pass
@@ -1031,7 +1061,7 @@ class AcquisitionManager:
                                         "scale_b": b,
                                         "zero_applied": float(zero_eng),
                                     }
-                                    channels.append(ChannelObject("Acquisition", ui_name, data_eng, properties=props))
+                                    channels.append(ChannelObject(group_name, ui_name, data_eng, properties=props))
                                     phys_data_eng_by_name[phys] = np.asarray(data_eng, dtype=np.float64)
                                 except Exception as e:
                                     # Skip problematic channel but continue writing others
@@ -1075,7 +1105,7 @@ class AcquisitionManager:
                                         "runtime_error": str(calc_err.get(cc, "") or ""),
                                     }
                                     channels.append(
-                                        ChannelObject("Acquisition", calc_name, np.ascontiguousarray(arr, dtype=np.float64), properties=props)
+                                        ChannelObject(group_name, calc_name, np.ascontiguousarray(arr, dtype=np.float64), properties=props)
                                     )
                         except Exception as e:
                             print("Writer error (data channels build):", e)

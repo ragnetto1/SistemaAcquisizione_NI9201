@@ -1,4 +1,4 @@
-# ui.py
+﻿# ui.py
 from PyQt5 import QtCore, QtWidgets, QtGui
 import sys
 import configparser
@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 import datetime
 import json
 import time
+import threading
 from typing import List, Callable, Optional, Dict, Any, Tuple
 
 from calculated_channels_engine import CalculatedChannelsEngine
@@ -219,6 +220,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._save_dir = DEFAULT_SAVE_DIR
         self._base_filename = "SenzaNome.tdms"
         self._active_subdir = None
+        self._recording_start_sample_index = 0
+        self._merge_state_lock = threading.Lock()
+        self._merge_state: Dict[str, Any] = {"state": "idle", "progress": 0.0, "message": "", "final_tdms": "", "error": "", "post_applied": False, "started_ns": 0, "updated_ns": 0}
+        self._merge_worker_thread: Optional[threading.Thread] = None
         self._countdown = 60
         self._count_timer = QtCore.QTimer(self)
         self._count_timer.setInterval(1000)
@@ -623,7 +628,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         if not os.path.isfile(CONFIG_FILE):
             return
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
                 cfg = json.load(f)
         except Exception:
             return
@@ -709,7 +714,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            with open(CONFIG_FILE, "w", encoding="utf-8-sig") as f:
                 json.dump(cfg, f, indent=2)
         except Exception:
             pass
@@ -2035,7 +2040,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             if not log_path:
                 return
             need_header = not os.path.isfile(log_path)
-            with open(log_path, "a", encoding="utf-8") as f:
+            with open(log_path, "a", encoding="utf-8-sig") as f:
                 if need_header:
                     f.write("ts,rss_mb,frame_ms_ewma,queue_len,queue_cap,queue_dropped,budget_chart,budget_instant,budget_preview,gui_interval_ms,guardrail,background\n")
                 f.write(
@@ -2329,6 +2334,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._sync_agent.register_handler("START_SYNC", self._sync_cmd_start_sync)
         self._sync_agent.register_handler("START_SAVE", self._sync_cmd_start_save)
         self._sync_agent.register_handler("SET_SYNC_WRITE_CUTOFF", self._sync_cmd_set_sync_write_cutoff)
+        self._sync_agent.register_handler("STOP_SAFE", self._sync_cmd_stop_safe)
+        self._sync_agent.register_handler("START_MERGE_ASYNC", self._sync_cmd_start_merge_async)
+        self._sync_agent.register_handler("MERGE_STATUS", self._sync_cmd_merge_status)
         self._sync_agent.register_handler("STOP_AND_MERGE", self._sync_cmd_stop_and_merge)
         self._sync_agent.register_handler("UNLOCK_UI", self._sync_cmd_unlock_ui)
         self._sync_agent.register_handler("ABORT_PREPARED", self._sync_cmd_abort_prepared)
@@ -2357,7 +2365,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                     fs_max_hz = 0.0
         return {
             "module_id": str(self._sync_agent.module_id() if self._sync_agent is not None else ""),
+            "board_number": "9201",
             "device_name": device_name,
+            "group_name": str(getattr(self.acq, "_tdms_group_name", lambda: "Acquisition")() or "Acquisition"),
             "active_channels": active_channels,
             "fs_max_hz": float(fs_max_hz if fs_max_hz > 0 else 0.0),
             "current_rate_hz": float(getattr(self.acq, "current_rate_hz", 0.0) or 0.0),
@@ -2365,6 +2375,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             "running": bool(getattr(self.acq, "_running", False)),
             "recording": bool(getattr(self.acq, "recording_enabled", False)),
             "samples_acquired": int(getattr(self.acq, "_global_samples", 0) or 0),
+            "recording_start_index": int(getattr(self, "_recording_start_sample_index", 0) or 0),
+            "samples_recording": int(max(0, int(getattr(self.acq, "_global_samples", 0) or 0) - int(getattr(self, "_recording_start_sample_index", 0) or 0))),
         }
 
     def _sync_emit_status_update(self):
@@ -2401,7 +2413,18 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.btnStop.setEnabled(False)
         else:
             self.btnStart.setEnabled(not bool(self.acq.recording_enabled))
-            self.btnStop.setEnabled(bool(self.acq.recording_enabled))
+            self._set_stop_button_enabled_for_recording()
+
+    def _set_stop_button_enabled_for_recording(self, recording: Optional[bool] = None) -> None:
+        try:
+            rec = bool(self.acq.recording_enabled) if recording is None else bool(recording)
+        except Exception:
+            rec = bool(recording) if recording is not None else False
+        allow_local_stop = bool(rec) and (not bool(getattr(self, "_sync_remote_active", False)))
+        try:
+            self.btnStop.setEnabled(allow_local_stop)
+        except Exception:
+            pass
 
     def _run_without_message_boxes(self, fn):
         orig_info = QtWidgets.QMessageBox.information
@@ -2456,6 +2479,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         if fs_hz > 0:
             self.rateEdit.setText(str(int(round(fs_hz))))
             self._run_without_message_boxes(self._on_rate_edit_finished)
+        try:
+            self.rateEdit.setToolTip("frequenza di acquisizione del dataset sincronizzato finale")
+        except Exception:
+            pass
 
         snap = self._sync_status_snapshot()
         self._sync_emit_status_update()
@@ -2525,6 +2552,12 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         sample_clk_mode = str(payload.get("sample_clock_mode", "") or "").strip().lower()
         sample_clk_src = str(payload.get("sample_clock_source", "") or "").strip()
         sample_clk_edge = str(payload.get("sample_clock_edge", "rising") or "rising").strip().lower()
+        master_timebase_src = str(payload.get("master_timebase_source", "") or "").strip()
+        try:
+            master_timebase_rate = float(payload.get("master_timebase_rate_hz", 0.0) or 0.0)
+        except Exception:
+            master_timebase_rate = 0.0
+        sync_pulse_src = str(payload.get("sync_pulse_source", "") or "").strip()
         try:
             sample_clk_rate = float(payload.get("sample_clock_rate_hz", 0.0) or 0.0)
         except Exception:
@@ -2538,6 +2571,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 "sample_clock_source": sample_clk_src,
                 "sample_clock_edge": sample_clk_edge,
                 "sample_clock_rate_hz": sample_clk_rate,
+                "master_timebase_source": master_timebase_src,
+                "master_timebase_rate_hz": master_timebase_rate,
+                "sync_pulse_source": sync_pulse_src,
             }
         else:
             self._pending_sync_start_cfg = None
@@ -2625,16 +2661,339 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._sync_emit_status_update()
         return snap
 
-    def _sync_cmd_stop_and_merge(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _sync_set_merge_state(self, **kwargs) -> None:
+        now_ns = int(time.time_ns())
+        with self._merge_state_lock:
+            state = dict(self._merge_state)
+            state.update(kwargs)
+            state["updated_ns"] = now_ns
+            self._merge_state = state
+
+    def _sync_get_merge_state(self) -> Dict[str, Any]:
+        with self._merge_state_lock:
+            return dict(self._merge_state)
+
+    def _sync_stop_save_only(self) -> None:
+        try:
+            self.acq.stop_graceful()
+        except Exception:
+            pass
+        try:
+            self.acq.stop()
+        except Exception:
+            pass
+        try:
+            self.acq.set_recording(False)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "_auto_fft_change") and hasattr(self, "chkFftEnable"):
+                self._auto_fft_change = True
+                self.chkFftEnable.setChecked(False)
+        except Exception:
+            pass
+        finally:
+            if hasattr(self, "_auto_fft_change"):
+                self._auto_fft_change = False
+        try:
+            if hasattr(self, "_fft_enabled"):
+                self._fft_enabled = False
+            if hasattr(self, "_clear_fft_plot_visuals"):
+                self._clear_fft_plot_visuals(clear_cached=False)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "sigFftWorkerReset"):
+                self.sigFftWorkerReset.emit(True, True)
+        except Exception:
+            pass
+
+        try:
+            if self._count_timer.isActive():
+                self._count_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.btnStart.setText("Salva dati")
+            self.btnStart.setEnabled(True)
+            self.btnStop.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            self.guiTimer.stop()
+        except Exception:
+            pass
+
+    def _sync_build_final_tdms_path(self) -> str:
+        final_path = os.path.join(self._save_dir, self._base_filename)
+        try:
+            if os.path.exists(final_path):
+                base_name, ext = os.path.splitext(self._base_filename)
+                dt_str = datetime.datetime.now().strftime("%d_%m_%y_%H_%M_%S")
+                new_name = f"{base_name}_{dt_str}{ext or '.tdms'}"
+                final_path = os.path.join(self._save_dir, new_name)
+        except Exception:
+            pass
+        return final_path
+
+    def _sync_collect_optional_fft_data(self) -> Optional[Dict[str, Any]]:
+        try:
+            freq = getattr(self, "_last_fft_freq", None)
+            mags = getattr(self, "_last_fft_mag_by_phys", None)
+            fresh_fft = (
+                int(getattr(self, "_fft_result_counter", 0))
+                > int(getattr(self, "_fft_result_counter_at_record_start", 0))
+            )
+            if not fresh_fft or not isinstance(freq, np.ndarray) or freq.size <= 0:
+                return None
+            if not isinstance(mags, dict) or not mags:
+                return None
+            ch_map: Dict[str, np.ndarray] = {}
+            units_map: Dict[str, str] = {}
+            for phys, arr in mags.items():
+                try:
+                    if not (isinstance(arr, np.ndarray) and arr.size == freq.size):
+                        continue
+                except Exception:
+                    continue
+                label = self._start_label_by_phys.get(phys, self._label_by_phys.get(phys, phys))
+                fft_label = f"FFT_{label}"
+                ch_map[fft_label] = arr.astype(np.float64)
+                unit = self._calib_by_phys.get(phys, {}).get("unit", "")
+                units_map[fft_label] = str(unit or "")
+            if not ch_map:
+                return None
+            return {
+                "freq": freq.astype(np.float64),
+                "channels": ch_map,
+                "units": units_map,
+                "duration": float(getattr(self, "_fft_duration_seconds", 0.0) or 0.0),
+            }
+        except Exception:
+            return None
+
+    def _sync_merge_worker(self, tmp_subdir: str, final_path: str, fft_data: Optional[Dict[str, Any]]) -> None:
+        try:
+            from tdms_merge import TdmsMerger
+
+            merger = TdmsMerger()
+            try:
+                anchor = getattr(self.acq, "_sync_anchor_epoch_s", None)
+                cutoff = int(getattr(self.acq, "_sync_write_start_index", 0) or 0)
+                fs = float(getattr(self.acq, "current_rate_hz", 0.0) or 0.0)
+                if anchor is not None:
+                    forced = float(anchor)
+                    if cutoff > 0 and fs > 0:
+                        forced += float(cutoff) / float(fs)
+                    merger.forced_wf_start_time = datetime.datetime.fromtimestamp(forced)
+            except Exception:
+                pass
+
+            if fft_data and hasattr(merger, "fft_data"):
+                try:
+                    merger.fft_data = fft_data
+                except Exception:
+                    pass
+
+            self._sync_set_merge_state(
+                state="running",
+                progress=0.0,
+                message="Finalizzazione in corso...",
+                final_tdms="",
+                error="",
+            )
+
+            def _merge_progress(curr: int, total: int) -> None:
+                total_i = max(1, int(total))
+                curr_i = max(0, min(int(curr), total_i))
+                self._sync_set_merge_state(
+                    state="running",
+                    progress=float(curr_i) / float(total_i),
+                    message=f"Finalizzazione in corso... ({curr_i}/{total_i})",
+                )
+
+            merger.merge_temp_tdms(tmp_subdir, final_path, progress_cb=_merge_progress)
+            try:
+                if tmp_subdir and os.path.isdir(tmp_subdir):
+                    shutil.rmtree(tmp_subdir, ignore_errors=True)
+            except Exception:
+                pass
+
+            self._sync_set_merge_state(
+                state="done",
+                progress=1.0,
+                message="Finalizzazione completata.",
+                final_tdms=final_path,
+                error="",
+            )
+        except Exception as exc:
+            self._sync_set_merge_state(
+                state="failed",
+                progress=0.0,
+                message="Finalizzazione fallita.",
+                final_tdms="",
+                error=f"{exc.__class__.__name__}: {exc}",
+            )
+
+    def _sync_cmd_stop_safe(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
         before = self._find_latest_tdms()
-        self._run_without_message_boxes(self._on_stop)
-        after = self._find_latest_tdms()
+        self._sync_stop_save_only()
         self._sync_remote_active = False
         self._sync_arm_requested = False
+        tmp_subdir = str(self._active_subdir or "").strip()
+        merge_pending = bool(str(self._active_subdir or "").strip())
+        if merge_pending:
+            self._sync_set_merge_state(
+                state="pending",
+                progress=0.0,
+                message="In attesa finalizzazione...",
+                final_tdms="",
+                error="",
+                post_applied=False,
+                started_ns=int(time.time_ns()),
+            )
+        else:
+            self._sync_set_merge_state(
+                state="done",
+                progress=1.0,
+                message="Nessuna finalizzazione necessaria.",
+                final_tdms=str(before or ""),
+                error="",
+                post_applied=False,
+                started_ns=int(time.time_ns()),
+            )
         snap = self._sync_status_snapshot()
         snap["recording"] = bool(self.acq.recording_enabled)
-        snap["final_tdms"] = after or before
+        snap["merge_pending"] = bool(merge_pending)
+        snap["final_tdms"] = str(before or "")
+        snap["spool_dir"] = tmp_subdir
+        snap["save_dir"] = str(self._save_dir or "")
+        snap["base_filename"] = str(self._base_filename or "")
+        snap["group_name"] = str(getattr(self.acq, "_tdms_group_name", lambda: "Acquisition")() or "Acquisition")
+        snap["board_number"] = "9201"
+        state = self._sync_get_merge_state()
+        snap["merge_state"] = str(state.get("state", "idle") or "idle")
+        snap["merge_progress"] = float(state.get("progress", 0.0) or 0.0)
+        snap["merge_message"] = str(state.get("message", "") or "")
         self._sync_emit_status_update()
+        return snap
+
+    def _sync_cmd_start_merge_async(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
+        worker = getattr(self, "_merge_worker_thread", None)
+        if worker is not None and worker.is_alive():
+            state = self._sync_get_merge_state()
+            snap = self._sync_status_snapshot()
+            snap["merge_state"] = str(state.get("state", "running") or "running")
+            snap["merge_progress"] = float(state.get("progress", 0.0) or 0.0)
+            snap["merge_message"] = str(state.get("message", "") or "")
+            snap["merge_started"] = True
+            self._sync_emit_status_update()
+            return snap
+
+        tmp_subdir = str(self._active_subdir or "").strip()
+        if not tmp_subdir or not os.path.isdir(tmp_subdir):
+            latest = self._find_latest_tdms()
+            self._sync_set_merge_state(
+                state="done",
+                progress=1.0,
+                message="Nessuna finalizzazione necessaria.",
+                final_tdms=str(latest or ""),
+                error="",
+                post_applied=False,
+            )
+            snap = self._sync_status_snapshot()
+            snap["merge_state"] = "done"
+            snap["merge_progress"] = 1.0
+            snap["merge_message"] = "Nessuna finalizzazione necessaria."
+            snap["final_tdms"] = str(latest or "")
+            snap["merge_started"] = False
+            self._sync_emit_status_update()
+            return snap
+
+        final_path = self._sync_build_final_tdms_path()
+        fft_data = self._sync_collect_optional_fft_data()
+        self._sync_set_merge_state(
+            state="running",
+            progress=0.0,
+            message="Finalizzazione in corso...",
+            final_tdms="",
+            error="",
+            post_applied=False,
+            started_ns=int(time.time_ns()),
+        )
+        th = threading.Thread(
+            target=self._sync_merge_worker,
+            args=(tmp_subdir, final_path, fft_data),
+            name=f"merge-{self.__class__.__name__}",
+            daemon=True,
+        )
+        self._merge_worker_thread = th
+        th.start()
+
+        snap = self._sync_status_snapshot()
+        snap["merge_state"] = "running"
+        snap["merge_progress"] = 0.0
+        snap["merge_message"] = "Finalizzazione in corso..."
+        snap["merge_started"] = True
+        self._sync_emit_status_update()
+        return snap
+
+    def _sync_cmd_merge_status(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
+        state = self._sync_get_merge_state()
+        merge_state = str(state.get("state", "idle") or "idle").lower()
+
+        if merge_state in ("done", "failed") and not bool(state.get("post_applied", False)):
+            self._active_subdir = None
+            try:
+                self.acq.set_sync_write_start_index(0)
+                self.acq.set_sync_anchor_epoch_s(None)
+            except Exception:
+                pass
+            try:
+                self._set_table_lock(False)
+            except Exception:
+                pass
+            try:
+                self._uncheck_all_enabled()
+            except Exception:
+                pass
+            self._sync_set_merge_state(post_applied=True)
+            state = self._sync_get_merge_state()
+            merge_state = str(state.get("state", merge_state) or merge_state).lower()
+
+        if merge_state == "failed":
+            err = str(state.get("error", "Ricomposizione TDMS fallita.") or "Ricomposizione TDMS fallita.")
+            raise RuntimeError(err)
+
+        snap = self._sync_status_snapshot()
+        snap["merge_state"] = merge_state
+        snap["merge_progress"] = float(state.get("progress", 0.0) or 0.0)
+        snap["merge_message"] = str(state.get("message", "") or "")
+        snap["final_tdms"] = str(state.get("final_tdms", "") or "")
+        snap["merge_done"] = bool(merge_state == "done")
+        self._sync_emit_status_update()
+        return snap
+
+    def _sync_cmd_stop_and_merge(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
+        self._sync_cmd_stop_safe(_payload)
+        self._sync_cmd_start_merge_async({})
+        deadline = time.monotonic() + 7200.0
+        while time.monotonic() < deadline:
+            state = self._sync_get_merge_state()
+            merge_state = str(state.get("state", "idle") or "idle").lower()
+            if merge_state == "done":
+                break
+            if merge_state == "failed":
+                err = str(state.get("error", "Ricomposizione TDMS fallita.") or "Ricomposizione TDMS fallita.")
+                raise RuntimeError(err)
+            time.sleep(0.05)
+
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Timeout finalizzazione TDMS.")
+
+        snap = self._sync_cmd_merge_status({})
+        snap["recording"] = bool(self.acq.recording_enabled)
         return snap
 
     def _sync_cmd_unlock_ui(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -3240,7 +3599,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # point a new acquisition has just started but recording (salvataggio) has
         # not yet been enabled via the "Salva dati" button, so leave it disabled.
         try:
-            self.btnStop.setEnabled(bool(self.acq.recording_enabled))
+            self._set_stop_button_enabled_for_recording()
         except Exception:
             # Fallback: disable the button if we cannot read the recording state
             self.btnStop.setEnabled(False)
@@ -3259,10 +3618,14 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             cur_agg = (self.acq.current_agg_rate_hz or 0) / 1e3
             lim_single = (self.acq.max_single_rate_hz or 0) / 1e3
             lim_multi  = (self.acq.max_multi_rate_hz  or 0) / 1e3
+            sync_txt = ""
+            if self._sync_agent is not None and self._sync_agent.is_active():
+                sync_txt = f"  |  Fs dataset sincronizzato {str(self.rateEdit.text() or '').strip() or 'Max'} Hz"
             self.lblRateInfo.setText(
                 f"Canali: {', '.join(labels)}  |  "
                 f"Rate per-canale {cur_per:.1f} kS/s  (agg: {cur_agg:.1f} kS/s)  |  "
                 f"Limiti modulo -> single {lim_single:.1f} kS/s, aggregato {lim_multi:.1f} kS/s"
+                f"{sync_txt}"
             )
         except Exception:
             self.lblRateInfo.setText("-")
@@ -3333,7 +3696,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                         self._reset_plots_curves()
                         # Enable the Stop/Recompose button only if we are currently recording.
                         try:
-                            self.btnStop.setEnabled(bool(self.acq.recording_enabled))
+                            self._set_stop_button_enabled_for_recording()
                         except Exception:
                             self.btnStop.setEnabled(False)
                         if not self.guiTimer.isActive():
@@ -3421,13 +3784,17 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.acq.set_output_directory(subdir)
         # set base filename (without extension) for naming the TDMS segments
         self.acq.set_base_filename(base_name)
+        try:
+            self._recording_start_sample_index = int(getattr(self.acq, "_global_samples", 0) or 0)
+        except Exception:
+            self._recording_start_sample_index = 0
         # enable recording so the writer will start accumulating blocks in RAM
         self.acq.set_recording(True)
 
         # Now that recording is active, the Stop/Recompose button can be used to
         # stop and merge the temporary TDMS files.  Enable it explicitly.
         try:
-            self.btnStop.setEnabled(True)
+            self._set_stop_button_enabled_for_recording(True)
         except Exception:
             pass
 
@@ -4120,7 +4487,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         cfg = configparser.ConfigParser()
         if os.path.isfile(path):
             try:
-                cfg.read(path, encoding="utf-8")
+                cfg.read(path, encoding="utf-8-sig")
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "Errore", f"Impossibile leggere workspace:\n{e}")
                 return
@@ -4136,7 +4503,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             ans = QtWidgets.QMessageBox.question(
                 self,
                 "Conferma sovrascrittura",
-                "Scheda giÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¾ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â  presente vuoi sovrascriverla?",
+                "Scheda gia presente, vuoi sovrascriverla?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No,
             )
@@ -4239,7 +4606,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         calcsec["rows_json"] = json.dumps(self._calc_rows_payload())
 
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8-sig") as f:
                 cfg.write(f)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Errore", f"Impossibile salvare il workspace:\n{e}")
@@ -4258,7 +4625,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         cfg = configparser.ConfigParser()
         try:
-            cfg.read(fname, encoding="utf-8")
+            cfg.read(fname, encoding="utf-8-sig")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Errore", f"Impossibile leggere workspace:\n{e}")
             return
@@ -4809,6 +5176,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self._auto_change = False
         # applica lo stato all'acquisizione
         self._update_acquisition_from_table()
+
 
 
 
