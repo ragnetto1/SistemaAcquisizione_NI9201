@@ -14,7 +14,22 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 
+def _install_quiet_keyboardinterrupt_excepthook() -> None:
+    previous = sys.excepthook
+
+    def _quiet_excepthook(exc_type, exc_value, exc_tb):
+        if exc_type is KeyboardInterrupt or isinstance(exc_value, KeyboardInterrupt):
+            return
+        try:
+            previous(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+
+    sys.excepthook = _quiet_excepthook
+
+
 def main():
+    _install_quiet_keyboardinterrupt_excepthook()
     from PyQt5 import QtWidgets
     from acquisition import AcquisitionManager
     from tdms_merge import TdmsMerger

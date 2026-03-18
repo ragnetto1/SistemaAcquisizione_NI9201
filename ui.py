@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 import datetime
 import json
 import time
+import traceback
 import threading
 from typing import List, Callable, Optional, Dict, Any, Tuple
 
@@ -2415,6 +2416,23 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.btnStart.setEnabled(not bool(self.acq.recording_enabled))
             self._set_stop_button_enabled_for_recording()
 
+    def _update_window_close_button_state(self, recording: Optional[bool] = None) -> None:
+        try:
+            rec = bool(self.acq.recording_enabled) if recording is None else bool(recording)
+        except Exception:
+            rec = bool(recording) if recording is not None else False
+        allow_close = not bool(rec)
+        try:
+            flags = self.windowFlags()
+            target_flags = flags | QtCore.Qt.WindowCloseButtonHint if allow_close else flags & ~QtCore.Qt.WindowCloseButtonHint
+            if target_flags != flags:
+                was_visible = self.isVisible()
+                self.setWindowFlag(QtCore.Qt.WindowCloseButtonHint, allow_close)
+                if was_visible:
+                    self.show()
+        except Exception:
+            pass
+
     def _set_stop_button_enabled_for_recording(self, recording: Optional[bool] = None) -> None:
         try:
             rec = bool(self.acq.recording_enabled) if recording is None else bool(recording)
@@ -2425,6 +2443,21 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.btnStop.setEnabled(allow_local_stop)
         except Exception:
             pass
+        self._update_window_close_button_state(rec)
+
+    def _confirm_user_close_request(self) -> bool:
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setWindowTitle("Conferma chiusura modulo")
+        if self._sync_agent is not None:
+            box.setText("Chiudere questo modulo?")
+            box.setInformativeText("Il modulo verra escluso dallo chassis e dalla sincronizzazione corrente.")
+        else:
+            box.setText("Chiudere questo modulo?")
+            box.setInformativeText("Il modulo verra chiuso completamente.")
+        box.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        box.setDefaultButton(QtWidgets.QMessageBox.No)
+        return box.exec_() == QtWidgets.QMessageBox.Yes
 
     def _run_without_message_boxes(self, fn):
         orig_info = QtWidgets.QMessageBox.information
@@ -3027,11 +3060,35 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._sync_emit_status_update()
         return snap
 
+    def _perform_remote_shutdown(self) -> None:
+        if bool(getattr(self, "_shutdown_in_progress", False)):
+            return
+        self._shutdown_in_progress = True
+        self._allow_close_after_shutdown = True
+        try:
+            self._close_sync_agent_for_shutdown()
+        except Exception:
+            pass
+        try:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                app.quit()
+            else:
+                self.close()
+        except Exception:
+            try:
+                self.close()
+            except Exception:
+                pass
+
     def _sync_cmd_shutdown(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            QtCore.QMetaObject.invokeMethod(self, "close", QtCore.Qt.QueuedConnection)
+            QtCore.QTimer.singleShot(0, self._perform_remote_shutdown)
         except Exception:
-            QtCore.QTimer.singleShot(0, self.close)
+            try:
+                self._perform_remote_shutdown()
+            except Exception:
+                pass
         return {"shutdown": True}
 
     # ----------------------------- Devices -----------------------------
@@ -4982,9 +5039,22 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     def _close_sync_agent_for_shutdown(self) -> None:
         try:
-            if self._sync_agent is not None:
-                self._sync_agent.close()
-                self._sync_agent = None
+            agent = self._sync_agent
+            self._sync_agent = None
+            if agent is None:
+                return
+            try:
+                agent._stop_event.set()
+            except Exception:
+                pass
+            try:
+                agent._close_socket()
+            except Exception:
+                pass
+            try:
+                QtCore.QTimer.singleShot(0, agent.close)
+            except Exception:
+                pass
         except BaseException:
             pass
 
@@ -5025,7 +5095,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             ("detach_callbacks", self._detach_acquisition_callbacks),
             ("stop_timers", self._stop_periodic_timers_for_shutdown),
             ("save_config", self._save_config),
-            ("close_sync_agent", self._close_sync_agent_for_shutdown),
             ("stop_core", self._shutdown_core_for_close),
             ("disconnect_signals", self._disconnect_ui_signals_for_shutdown),
         ]
@@ -5037,9 +5106,206 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 pass
         self._shutdown_phase = "done"
 
+    def _shutdown_phase_steps(self):
+        phases = [
+            ("deactivate_channels", self._deactivate_all_channels_for_shutdown),
+            ("detach_callbacks", self._detach_acquisition_callbacks),
+            ("stop_timers", self._stop_periodic_timers_for_shutdown),
+            ("save_config", self._save_config),
+            ("stop_core", self._shutdown_core_for_close),
+        ]
+        if hasattr(self, "_shutdown_fft_for_close"):
+            try:
+                phases.append(("stop_fft", self._shutdown_fft_for_close))
+            except Exception:
+                pass
+        phases.append(("disconnect_signals", self._disconnect_ui_signals_for_shutdown))
+        return phases
+
+    def _phase_label_for_user_close(self, phase_name: str) -> str:
+        mapping = {
+            "deactivate_channels": "Disattivazione canali...",
+            "detach_callbacks": "Distacco callback...",
+            "stop_timers": "Arresto timer...",
+            "save_config": "Salvataggio configurazione...",
+            "stop_core": "Arresto core acquisizione...",
+            "stop_fft": "Arresto worker FFT...",
+            "disconnect_signals": "Disconnessione segnali UI...",
+        }
+        return mapping.get(str(phase_name or ""), "Chiusura modulo in corso...")
+
+    def _append_guided_close_detail(self, text: str) -> None:
+        msg = str(text or "").strip()
+        if not msg:
+            return
+        box = getattr(self, "_guided_close_details", None)
+        if box is None:
+            return
+        try:
+            box.appendPlainText(msg)
+            cursor = box.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.End)
+            box.setTextCursor(cursor)
+        except Exception:
+            pass
+
+    def _close_guided_progress_dialog(self) -> None:
+        dlg = getattr(self, "_guided_close_dialog", None)
+        if dlg is not None:
+            try:
+                dlg.close()
+                dlg.deleteLater()
+            except Exception:
+                pass
+        self._guided_close_dialog = None
+        self._guided_close_label = None
+        self._guided_close_progress = None
+        self._guided_close_details = None
+
+    def _fail_guided_close(self, details: str) -> None:
+        self._close_request_running = False
+        self._allow_close_after_shutdown = False
+        self._shutdown_in_progress = False
+        self._shutdown_phase = "error"
+        self._append_guided_close_detail("ERRORE durante la chiusura guidata.")
+        if details:
+            self._append_guided_close_detail(details)
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Critical)
+        box.setWindowTitle("Chiusura modulo fallita")
+        box.setText("La chiusura del modulo non e stata completata.")
+        box.setInformativeText("Il modulo resta aperto per evitare uno stato incoerente.")
+        if details:
+            box.setDetailedText(details)
+        box.exec_()
+        self._close_guided_progress_dialog()
+
+    def _run_next_guided_close_phase(self) -> None:
+        if not bool(getattr(self, "_close_request_running", False)):
+            return
+        phases = list(getattr(self, "_guided_close_phases", []) or [])
+        idx = int(getattr(self, "_guided_close_phase_index", 0) or 0)
+        label = getattr(self, "_guided_close_label", None)
+        progress = getattr(self, "_guided_close_progress", None)
+        if idx >= len(phases):
+            self._shutdown_phase = "done"
+            self._close_request_running = False
+            self._allow_close_after_shutdown = True
+            self._append_guided_close_detail("Fasi completate. Chiusura finestra...")
+            try:
+                if progress is not None:
+                    progress.setValue(len(phases))
+            except Exception:
+                pass
+            self._close_guided_progress_dialog()
+            QtCore.QTimer.singleShot(0, self.close)
+            return
+
+        phase_name, fn = phases[idx]
+        phase_label = self._phase_label_for_user_close(phase_name)
+        self._shutdown_phase = str(phase_name)
+        self._shutdown_in_progress = True
+        self._append_guided_close_detail(f"[{idx + 1}/{len(phases)}] START {phase_name}")
+        try:
+            if label is not None:
+                label.setText(phase_label)
+            if progress is not None:
+                progress.setValue(idx)
+        except Exception:
+            pass
+        QtWidgets.QApplication.processEvents()
+        try:
+            fn()
+            self._append_guided_close_detail(f"[{idx + 1}/{len(phases)}] OK {phase_name}")
+        except BaseException:
+            self._fail_guided_close(traceback.format_exc())
+            return
+
+        self._guided_close_phase_index = idx + 1
+        try:
+            if progress is not None:
+                progress.setValue(self._guided_close_phase_index)
+        except Exception:
+            pass
+        QtCore.QTimer.singleShot(0, self._run_next_guided_close_phase)
+
+    def _start_guided_close(self, require_confirmation: bool = True, allow_recording_close: bool = False, show_dialog: bool = True) -> None:
+        if bool(getattr(self, "_close_request_running", False)):
+            return
+        try:
+            recording = bool(self.acq.recording_enabled)
+        except Exception:
+            recording = False
+        if recording and not bool(allow_recording_close):
+            box = QtWidgets.QMessageBox(self)
+            box.setIcon(QtWidgets.QMessageBox.Information)
+            box.setWindowTitle("Chiusura non consentita")
+            box.setText("Il modulo sta acquisendo.")
+            if self._sync_agent is not None:
+                box.setInformativeText("Arresta la sessione con 'Stop e ricomponi' dello chassis prima di chiudere il modulo.")
+            else:
+                box.setInformativeText("Arresta prima il modulo con 'Stop e ricomponi'.")
+            box.exec_()
+            return
+        if require_confirmation and (not self._confirm_user_close_request()):
+            return
+
+        phases = list(self._shutdown_phase_steps())
+        self._guided_close_phases = phases
+        self._guided_close_phase_index = 0
+        self._close_request_running = True
+        self._allow_close_after_shutdown = False
+        self._shutdown_in_progress = True
+
+        self._guided_close_dialog = None
+        self._guided_close_label = None
+        self._guided_close_progress = None
+        self._guided_close_details = None
+        if show_dialog:
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle("Chiusura modulo")
+            dlg.setWindowModality(QtCore.Qt.ApplicationModal)
+            try:
+                dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+            except Exception:
+                pass
+            dlg.setMinimumWidth(560)
+            layout = QtWidgets.QVBoxLayout(dlg)
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(8)
+            label = QtWidgets.QLabel("Chiusura modulo in corso...")
+            label.setWordWrap(True)
+            progress = QtWidgets.QProgressBar()
+            progress.setRange(0, max(1, len(phases)))
+            progress.setValue(0)
+            details = QtWidgets.QPlainTextEdit()
+            details.setReadOnly(True)
+            details.setMinimumHeight(140)
+            layout.addWidget(label)
+            layout.addWidget(progress)
+            layout.addWidget(details)
+            self._guided_close_dialog = dlg
+            self._guided_close_label = label
+            self._guided_close_progress = progress
+            self._guided_close_details = details
+            try:
+                dlg.show()
+                dlg.raise_()
+                dlg.activateWindow()
+            except Exception:
+                pass
+        self._append_guided_close_detail("Richiesta chiusura modulo ricevuta.")
+        self._append_guided_close_detail(f"Totale fasi: {len(phases)}")
+        QtCore.QTimer.singleShot(0, self._run_next_guided_close_phase)
+
     def closeEvent(self, event: QtGui.QCloseEvent):
-        self._run_shutdown_state_machine()
-        super().closeEvent(event)
+        if bool(getattr(self, "_allow_close_after_shutdown", False)):
+            self._allow_close_after_shutdown = False
+            event.accept()
+            super().closeEvent(event)
+            return
+        event.ignore()
+        self._start_guided_close(require_confirmation=True, allow_recording_close=False)
 
     def _on_zero_button_clicked(self, phys: str):
         """
