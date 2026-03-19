@@ -3120,7 +3120,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.critical(
                     self,
                     "Dispositivo non disponibile",
-                    f'Il dispositivo assegnato "{forced_device_name}" non e disponibile.',
+                    f'Il dispositivo assegnato "{forced_device_name}" non ? disponibile.',
                 )
                 self._abort_startup_on_device_cancel()
                 return
@@ -4560,7 +4560,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             ans = QtWidgets.QMessageBox.question(
                 self,
                 "Conferma sovrascrittura",
-                "Scheda gia presente, vuoi sovrascriverla?",
+                "Scheda gi? presente, vuoi sovrascriverla?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No,
             )
@@ -5167,13 +5167,22 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._allow_close_after_shutdown = False
         self._shutdown_in_progress = False
         self._shutdown_phase = "error"
+        try:
+            if bool(getattr(self, "_module_closing_notified", False)) and self._sync_agent is not None:
+                self._sync_agent.send_event(
+                    "MODULE_CLOSE_FAILED",
+                    {"error": "Chiusura modulo non completata.", "traceback": str(details or "")},
+                )
+        except Exception:
+            pass
+        self._module_closing_notified = False
         self._append_guided_close_detail("ERRORE durante la chiusura guidata.")
         if details:
             self._append_guided_close_detail(details)
         box = QtWidgets.QMessageBox(self)
         box.setIcon(QtWidgets.QMessageBox.Critical)
         box.setWindowTitle("Chiusura modulo fallita")
-        box.setText("La chiusura del modulo non e stata completata.")
+        box.setText("La chiusura del modulo non ? stata completata.")
         box.setInformativeText("Il modulo resta aperto per evitare uno stato incoerente.")
         if details:
             box.setDetailedText(details)
@@ -5198,7 +5207,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
             self._close_guided_progress_dialog()
-            QtCore.QTimer.singleShot(0, self.close)
+            QtCore.QTimer.singleShot(0, self._finalize_guided_close_exit)
             return
 
         phase_name, fn = phases[idx]
@@ -5249,6 +5258,12 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             return
         if require_confirmation and (not self._confirm_user_close_request()):
             return
+        try:
+            if self._sync_agent is not None and not bool(getattr(self, "_module_closing_notified", False)):
+                self._sync_agent.send_event("MODULE_CLOSING", {"reason": "user_close"})
+                self._module_closing_notified = True
+        except Exception:
+            pass
 
         phases = list(self._shutdown_phase_steps())
         self._guided_close_phases = phases
@@ -5298,11 +5313,29 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._append_guided_close_detail(f"Totale fasi: {len(phases)}")
         QtCore.QTimer.singleShot(0, self._run_next_guided_close_phase)
 
+    def _finalize_guided_close_exit(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+        try:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                QtCore.QTimer.singleShot(0, app.quit)
+        except Exception:
+            pass
+
     def closeEvent(self, event: QtGui.QCloseEvent):
         if bool(getattr(self, "_allow_close_after_shutdown", False)):
             self._allow_close_after_shutdown = False
             event.accept()
             super().closeEvent(event)
+            try:
+                app = QtWidgets.QApplication.instance()
+                if app is not None:
+                    QtCore.QTimer.singleShot(0, app.quit)
+            except Exception:
+                pass
             return
         event.ignore()
         self._start_guided_close(require_confirmation=True, allow_recording_close=False)

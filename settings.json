@@ -1,7 +1,7 @@
 ﻿{
-  "save_dir": "C:\\UG-WORK\\SistemaAcquisizione_CDAQ\\SenzaNome_18-03-2026_12-12-51\\_sync_spool\\NI9201_cDAQ2Mod1",
+  "save_dir": "C:\\UG-WORK\\SistemaAcquisizione_CDAQ\\SenzaNome_19-03-2026_14-18-17\\_sync_spool\\NI9201_cDAQ2Mod1",
   "base_filename": "SenzaNome.tdms",
-  "ram_mb": 10,
+  "ram_mb": 16,
   "show_phys_plot": false,
   "show_calc_plot": false,
   "chart_preset": "Operativo",
@@ -10,5 +10,5 @@
   "chart_robust_y": true,
   "chart_lock_y": false,
   "chart_cursors": false,
-  "fs": 120.0
+  "fs": 110.0
 }
