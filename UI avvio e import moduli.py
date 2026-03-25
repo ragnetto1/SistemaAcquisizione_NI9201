@@ -3,8 +3,9 @@ import importlib
 import sys
 import time
 import traceback
+from pathlib import Path
 
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 
 IMPORT_STEPS = [
@@ -13,6 +14,28 @@ IMPORT_STEPS = [
     ("ui", "import ui"),
     ("main", "import main"),
 ]
+
+
+def _load_signaldoki_icon() -> QtGui.QIcon:
+    try:
+        icon_dir = Path(__file__).resolve().parent.parent / "icone"
+        names = ("signaldoki-appicon.ico", "signaldoki-appicon.svg", "signaldoki-icon.svg") if sys.platform.startswith("win") else ("signaldoki-appicon.svg", "signaldoki-appicon.ico", "signaldoki-icon.svg")
+        for name in names:
+            icon_path = icon_dir / name
+            if icon_path.is_file():
+                return QtGui.QIcon(str(icon_path))
+    except Exception:
+        pass
+    return QtGui.QIcon()
+
+
+def _apply_windows_app_id(app_id: str) -> None:
+    try:
+        if sys.platform.startswith("win"):
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(str(app_id))
+    except Exception:
+        pass
 
 
 class ImportWorker(QtCore.QObject):
@@ -38,9 +61,16 @@ class ImportWorker(QtCore.QObject):
 
 class ImportStartupUI:
     def __init__(self) -> None:
+        _apply_windows_app_id("signaldoki.ni9201")
         self._app = QtWidgets.QApplication.instance()
         if self._app is None:
             self._app = QtWidgets.QApplication(sys.argv)
+        self._icon = _load_signaldoki_icon()
+        if not self._icon.isNull():
+            try:
+                self._app.setWindowIcon(self._icon)
+            except Exception:
+                pass
 
         self._progress = 0.0
         self._target = 0.0
@@ -61,6 +91,11 @@ class ImportStartupUI:
     def _build_ui(self) -> None:
         self._window = QtWidgets.QWidget()
         self._window.setWindowTitle("Avvio e import moduli")
+        if not self._icon.isNull():
+            try:
+                self._window.setWindowIcon(self._icon)
+            except Exception:
+                pass
         self._window.setFixedSize(620, 210)
         self._window.setObjectName("startupRoot")
         self._window.setStyleSheet(

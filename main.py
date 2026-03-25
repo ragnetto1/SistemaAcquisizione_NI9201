@@ -28,8 +28,31 @@ def _install_quiet_keyboardinterrupt_excepthook() -> None:
     sys.excepthook = _quiet_excepthook
 
 
+def _load_signaldoki_icon():
+    from PyQt5 import QtGui
+    try:
+        names = ("signaldoki-appicon.ico", "signaldoki-appicon.svg", "signaldoki-icon.svg") if sys.platform.startswith("win") else ("signaldoki-appicon.svg", "signaldoki-appicon.ico", "signaldoki-icon.svg")
+        for name in names:
+            icon_path = REPO_ROOT / "icone" / name
+            if icon_path.is_file():
+                return QtGui.QIcon(str(icon_path))
+    except Exception:
+        pass
+    return QtGui.QIcon()
+
+
+def _apply_windows_app_id(app_id: str) -> None:
+    try:
+        if sys.platform.startswith("win"):
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(str(app_id))
+    except Exception:
+        pass
+
+
 def main():
     _install_quiet_keyboardinterrupt_excepthook()
+    _apply_windows_app_id("signaldoki.ni9201")
     from PyQt5 import QtWidgets
     from acquisition import AcquisitionManager
     from tdms_merge import TdmsMerger
@@ -39,12 +62,23 @@ def main():
     if app is None:
         app = QtWidgets.QApplication(sys.argv)
         created_app = True
+    icon = _load_signaldoki_icon()
+    if not icon.isNull():
+        try:
+            app.setWindowIcon(icon)
+        except Exception:
+            pass
 
     # In questa versione l'applicazione e progettata esclusivamente per la NI-9201.
     # Non viene richiesto all'utente di selezionare il modello della scheda.
     acq_manager = AcquisitionManager()
     WindowCls = _resolve_window_class(acq_manager, default_digits="9201")
     window = WindowCls(acq_manager=acq_manager, merger=TdmsMerger())
+    if not icon.isNull():
+        try:
+            window.setWindowIcon(icon)
+        except Exception:
+            pass
     window.show()
 
     exit_code = app.exec_()
@@ -140,11 +174,18 @@ def _extract_missing_module_name(exc: BaseException) -> str:
 def _show_startup_error_and_exit(board_label: str, exc: Optional[BaseException], tb_text: str) -> None:
     from PyQt5 import QtWidgets
 
+    _apply_windows_app_id(f"signaldoki.{str(board_label or 'module').lower()}")
     app = QtWidgets.QApplication.instance()
     created_app = False
     if app is None:
         app = QtWidgets.QApplication(sys.argv)
         created_app = True
+    icon = _load_signaldoki_icon()
+    if not icon.isNull():
+        try:
+            app.setWindowIcon(icon)
+        except Exception:
+            pass
 
     missing_name = _extract_missing_module_name(exc) if exc else ""
     if missing_name:
