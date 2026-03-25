@@ -2341,6 +2341,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._sync_agent.register_handler("STOP_AND_MERGE", self._sync_cmd_stop_and_merge)
         self._sync_agent.register_handler("UNLOCK_UI", self._sync_cmd_unlock_ui)
         self._sync_agent.register_handler("ABORT_PREPARED", self._sync_cmd_abort_prepared)
+        self._sync_agent.register_handler("SAVE_WORKSPACE_TO_PATH", self._sync_cmd_save_workspace_to_path)
+        self._sync_agent.register_handler("LOAD_WORKSPACE_FROM_PATH", self._sync_cmd_load_workspace_from_path)
         self._sync_agent.register_handler("SHUTDOWN", self._sync_cmd_shutdown)
         self._sync_agent.start(
             {
@@ -4522,6 +4524,125 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             candidate = f"{base}_{idx}"
             idx += 1
         return candidate
+
+    def _run_workspace_via_existing_ui(self, mode: str, path: str) -> Dict[str, Any]:
+        target_path = str(path or "").strip()
+        if not target_path:
+            raise RuntimeError("Percorso workspace non valido.")
+        captured = {"error": "", "warning": "", "info": []}
+        QFileDialog = QtWidgets.QFileDialog
+        QMessageBox = QtWidgets.QMessageBox
+        old_exec = getattr(QFileDialog, "exec_", None)
+        old_selected = getattr(QFileDialog, "selectedFiles", None)
+        old_open = getattr(QFileDialog, "getOpenFileName", None)
+        old_info = getattr(QMessageBox, "information", None)
+        old_warn = getattr(QMessageBox, "warning", None)
+        old_crit = getattr(QMessageBox, "critical", None)
+        old_question = getattr(QMessageBox, "question", None)
+        had_notice = hasattr(self, "_show_themed_notice")
+        had_confirm = hasattr(self, "_ask_themed_confirmation")
+        old_notice = getattr(self, "_show_themed_notice", None)
+        old_confirm = getattr(self, "_ask_themed_confirmation", None)
+        def _capture_message(args):
+            parts = []
+            for a in args[2:]:
+                try:
+                    txt = str(a or "").strip()
+                except Exception:
+                    txt = ""
+                if txt:
+                    parts.append(txt)
+            return "\n".join(parts).strip()
+        def _fake_info(*args, **kwargs):
+            msg = _capture_message(args)
+            if msg:
+                captured["info"].append(msg)
+            return QMessageBox.Ok
+        def _fake_warn(*args, **kwargs):
+            captured["warning"] = _capture_message(args)
+            return QMessageBox.Ok
+        def _fake_crit(*args, **kwargs):
+            captured["error"] = _capture_message(args)
+            return QMessageBox.Ok
+        def _fake_question(*args, **kwargs):
+            return QMessageBox.Yes
+        def _fake_exec(dlg):
+            return QtWidgets.QDialog.Accepted
+        def _fake_selected(_dlg):
+            return [target_path]
+        def _fake_open(*args, **kwargs):
+            return (target_path, "INI (*.ini)")
+        def _fake_notice(title, text, details="", kind="info"):
+            msg = "\n".join([str(text or "").strip(), str(details or "").strip()]).strip()
+            k = str(kind or "info").strip().lower()
+            if k == "error":
+                captured["error"] = msg
+            elif k == "warning":
+                captured["warning"] = msg
+            elif msg:
+                captured["info"].append(msg)
+        try:
+            if old_exec is not None:
+                QFileDialog.exec_ = _fake_exec
+            if old_selected is not None:
+                QFileDialog.selectedFiles = _fake_selected
+            if old_open is not None:
+                QFileDialog.getOpenFileName = staticmethod(_fake_open)
+            if old_info is not None:
+                QMessageBox.information = staticmethod(_fake_info)
+            if old_warn is not None:
+                QMessageBox.warning = staticmethod(_fake_warn)
+            if old_crit is not None:
+                QMessageBox.critical = staticmethod(_fake_crit)
+            if old_question is not None:
+                QMessageBox.question = staticmethod(_fake_question)
+            if had_notice:
+                self._show_themed_notice = _fake_notice
+            if had_confirm:
+                self._ask_themed_confirmation = lambda *a, **k: True
+            if str(mode or "").strip().lower() == "save":
+                self._save_workspace()
+            else:
+                self._load_workspace()
+        finally:
+            if old_exec is not None:
+                QFileDialog.exec_ = old_exec
+            if old_selected is not None:
+                QFileDialog.selectedFiles = old_selected
+            if old_open is not None:
+                QFileDialog.getOpenFileName = old_open
+            if old_info is not None:
+                QMessageBox.information = old_info
+            if old_warn is not None:
+                QMessageBox.warning = old_warn
+            if old_crit is not None:
+                QMessageBox.critical = old_crit
+            if old_question is not None:
+                QMessageBox.question = old_question
+            if had_notice:
+                self._show_themed_notice = old_notice
+            if had_confirm:
+                self._ask_themed_confirmation = old_confirm
+        if captured["error"]:
+            raise RuntimeError(captured["error"])
+        if captured["warning"]:
+            raise RuntimeError(captured["warning"])
+        return {
+            "path": target_path,
+            "supporteddaq": self._workspace_supported_daq(),
+            "device_name": self._workspace_current_device_name(),
+            "messages": list(captured.get("info") or []),
+        }
+
+    def _sync_cmd_save_workspace_to_path(self, payload: dict) -> dict:
+        target_path = str(dict(payload or {}).get("path", "") or "").strip()
+        result = self._run_workspace_via_existing_ui("save", target_path)
+        return {"ok": True, "payload": result}
+
+    def _sync_cmd_load_workspace_from_path(self, payload: dict) -> dict:
+        target_path = str(dict(payload or {}).get("path", "") or "").strip()
+        result = self._run_workspace_via_existing_ui("load", target_path)
+        return {"ok": True, "payload": result}
 
     def _save_workspace(self):
         path = ""
